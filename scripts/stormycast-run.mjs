@@ -1,12 +1,13 @@
 // Runs Stormycast on ECMWF's newest open forecast (IFS, 0.25°) and makes the days it
-// publishes: for each 0.5° point of the globe and each of three days, the chance of each
-// hazard within 40 km (public/js/core/stormycast.mjs reads them).
+// publishes: for each 0.5° point of the globe and each of five days, the chance of thunder
+// and of each hazard within 40 km (public/js/core/stormycast.mjs reads them).
 //
 // A "day" is each place's own: 06:00 to 06:00 by the sun. The models were taught on ERA5 at
-// 21Z and 03Z over the US — mid-afternoon and evening there — so each point is given the
-// forecast step nearest 14:40 by its sun and the one six hours after, and the rain of
-// its day. A 00Z run gives the run's date and the two after; a 12Z run the three
-// after its date. Surface height and land come from ERA5 (kept in site-data/stormycast).
+// 15Z, 21Z, 03Z and 09Z over the US — morning, afternoon, evening and small hours there —
+// so each point is given the forecast step nearest 14:40 by its sun (a), 6 h before and
+// after it and 12 h after, and the rain of its day; each chance is calibrated for its lead
+// (hours to a). A 00Z run gives the run's date and the four after; a 12Z run the five after
+// its date. Surface height and land come from ERA5 (kept in site-data/stormycast).
 //
 //   node scripts/stormycast-run.mjs [YYYYMMDDHH] [--deploy]
 //
@@ -120,7 +121,7 @@ async function newestRun() {
   const now = Date.now();
   for (let t = Math.floor(now / (12 * H)) * 12 * H; t > now - 4 * 864e5; t -= 12 * H) {
     // Out when its last step needed is.
-    if (await indexOf(t, 102)) return t;
+    if (await indexOf(t, 150)) return t;
   }
   throw new Error('no ECMWF run found');
 }
@@ -128,11 +129,15 @@ const given = args.find((a) => /^\d{10}$/.test(a));
 const RUN = given ? Date.UTC(+given.slice(0, 4), +given.slice(4, 6) - 1, +given.slice(6, 8), +given.slice(8, 10)) : await newestRun();
 const runName = new Date(RUN).toISOString().slice(0, 13).replace(/[-T]/g, '');
 const runDate = Math.floor(RUN / 864e5) * 864e5;
-const DATES = [0, 1, 2].map((k) => runDate + (new Date(RUN).getUTCHours() === 0 ? k : k + 1) * 864e5);
+// Five days: a 00Z run gives its date and the four after; a 12Z run the five after its date.
+const NDAYS = 5;
+const DATES = Array.from({ length: NDAYS }, (_, k) => k).map((k) => runDate + (new Date(RUN).getUTCHours() === 0 ? k : k + 1) * 864e5);
 console.log('run', runName, 'days', DATES.map((d) => new Date(d).toISOString().slice(0, 10)).join(' '));
 
 // Each point's steps, day by day.
-const near3 = (t) => Math.max(0, Math.round((t - RUN) / (3 * H)) * 3);
+// ECMWF's open steps: every 3 h to 144 h, every 6 h after.
+const onStep = (s) => (s <= 144 ? s : Math.round(s / 6) * 6);
+const near3 = (t) => onStep(Math.max(0, Math.round((t - RUN) / (3 * H)) * 3));
 const plan = DATES.map((D) => {
   const a = new Int16Array(NX);
   const s = new Int16Array(NX);
@@ -150,7 +155,7 @@ const plan = DATES.map((D) => {
 // spacing the models learnt from (21Z, 03Z, 15Z and 09Z over the US).
 const SNAP_OFF = { a: 0, b: 6, m: -6, n: 12 };
 const SNAPS = FEATURES.some((f) => f.startsWith('m_')) ? ['a', 'b', 'm', 'n'] : ['a', 'b'];
-const stepOf = (p, i, w) => Math.max(0, p.a[i] + SNAP_OFF[w]);
+const stepOf = (p, i, w) => onStep(Math.max(0, p.a[i] + SNAP_OFF[w]));
 const snapSteps = new Set();
 const rainSteps = new Set();
 for (const p of plan) for (let i = 0; i < NX; i++) { for (const w of SNAPS) snapSteps.add(stepOf(p, i, w)); rainSteps.add(p.s[i]); rainSteps.add(p.e[i]); }
@@ -307,10 +312,12 @@ for (let d = 0; d < plan.length; d++) {
     }
     // ECMWF's values on ERA5's scale, as the models were taught.
     for (let f = 0; f < FEATURES.length; f++) x[f] = mapValue(maps[f], raw[f]);
-    for (let m = 0; m < models.length; m++) if (models[m]) out[m * NP + k] = Math.round(100 * chanceOf(models[m], x));
+    // Calibrated for how far ahead this point's afternoon is.
+    const lead = plan[d].a[k % NX];
+    for (let m = 0; m < models.length; m++) if (models[m]) out[m * NP + k] = Math.round(100 * chanceOf(models[m], x, lead));
     if (LTG) {
       for (let f = 0; f < FEATURES.length; f++) xl[f] = mapValue(ltgMaps[f], raw[f]);
-      const t = Math.round(100 * chanceOf(LTG, xl));
+      const t = Math.round(100 * chanceOf(LTG, xl, lead));
       out[models.length * NP + k] = t;
       for (let m = 0; m < models.length; m++) if (out[m * NP + k] > t) out[m * NP + k] = t;
     }

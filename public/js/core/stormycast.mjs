@@ -28,16 +28,7 @@ export function mapValue(m, v) {
   return v + (m.at(-1)[1] - m.at(-1)[0]);
 }
 
-/** A model's chance (0–1) for a feature vector (in STORMYCAST.features' order). */
-export function chanceOf(model, x) {
-  let z = model.base;
-  for (const t of model.trees) {
-    let n = t[0];
-    while (n.length === 4) { const v = x[n[0]]; n = t[v <= n[1] || Number.isNaN(v) ? n[2] : n[3]]; }
-    z += n[0];
-  }
-  const p = 1 / (1 + Math.exp(-z));
-  const c = model.curve;
+function onCurve(c, p) {
   for (let i = 1; i < c.length; i++) {
     if (p <= c[i][0]) {
       const [x0, y0] = c[i - 1];
@@ -46,6 +37,32 @@ export function chanceOf(model, x) {
     }
   }
   return c.at(-1)[1];
+}
+
+/**
+ * A model's chance (0–1) for a feature vector (in STORMYCAST.features' order). `lead`: hours
+ * from the run to the point's afternoon snapshot; a model calibrated by lead (`curves`,
+ * [hours, curve] pairs) blends its two nearest curves, so later days come out as unsure as
+ * they really are.
+ */
+export function chanceOf(model, x, lead = null) {
+  let z = model.base;
+  for (const t of model.trees) {
+    let n = t[0];
+    while (n.length === 4) { const v = x[n[0]]; n = t[v <= n[1] || Number.isNaN(v) ? n[2] : n[3]]; }
+    z += n[0];
+  }
+  const p = 1 / (1 + Math.exp(-z));
+  const cs = model.curves;
+  if (lead == null || !cs?.length) return onCurve(model.curve, p);
+  if (lead <= cs[0][0]) return onCurve(cs[0][1], p);
+  for (let i = 1; i < cs.length; i++) {
+    if (lead <= cs[i][0]) {
+      const f = (lead - cs[i - 1][0]) / (cs[i][0] - cs[i - 1][0]);
+      return (1 - f) * onCurve(cs[i - 1][1], p) + f * onCurve(cs[i][1], p);
+    }
+  }
+  return onCurve(cs.at(-1)[1], p);
 }
 
 // --- reading the published days ------------------------------------------------------------
@@ -85,7 +102,8 @@ async function latestDoc() {
   const [here, site] = await Promise.allSettled([docAt(LOCAL), docAt(BASE)]);
   const ok = [here, site].filter((x) => x.status === 'fulfilled').map((x) => x.value);
   if (!ok.length) throw site.reason || here.reason;
-  const doc = ok.sort((a, b) => (a.run < b.run ? 1 : -1))[0];
+  // The newer run; on a tie, the PC's own (made here, so at least as new).
+  const doc = ok.sort((a, b) => (a.run < b.run ? 1 : a.run > b.run ? -1 : 0))[0];
   latest = { at: Date.now(), doc };
   return doc;
 }
@@ -151,7 +169,7 @@ export const STORMYCAST = {
   id: 'stormycast',
   label: 'Stormycast',
   note: "Nexradar's own: chances within 25 mi, worldwide. Each place's own day.",
-  days: 3,
+  days: 5,
   kinds: KINDS.map(({ id, label }) => ({ id, label })),
   load: stormycastAreas,
   credit: 'Stormycast by stormy_sound, Nexradar: NOAA HRRR over the US; GOES GLM lightning; ECMWF open data (CC BY 4.0); contains modified Copernicus Climate Change Service information (ERA5); SPC storm reports',
