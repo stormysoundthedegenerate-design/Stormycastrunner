@@ -1,6 +1,6 @@
 # Runs Stormycast after each ECMWF run (00Z and 12Z) and publishes it to the `stormycast`
 # branch of the nexradar Cloudflare Pages project (https://stormycast.nexradar.pages.dev).
-# Needs the repository secrets CLOUDFLARE_API_TOKEN (Pages: Edit) and CLOUDFLARE_ACCOUNT_ID.
+# Needs the repository secrets STORMYCAST_TOKEN (a Cloudflare API token, Pages: Edit) and CLOUDFLARE_ACCOUNT_ID.
 name: Stormycast
 
 on:
@@ -30,5 +30,5 @@ jobs:
       - name: Run Stormycast and publish
         run: node --max-old-space-size=6000 scripts/stormycast-run.mjs --deploy
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.STORMYCAST_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
