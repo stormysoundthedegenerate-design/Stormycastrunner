@@ -19,8 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
       - name: Install Wrangler
@@ -28,7 +28,11 @@ jobs:
       - name: Keep the days already published
         run: node scripts/stormycast-pull.mjs
       - name: Run Stormycast and publish
-        run: node --max-old-space-size=6000 scripts/stormycast-run.mjs --deploy
+        # Spaces or line breaks pasted in with the secrets are dropped.
+        run: |
+          export CLOUDFLARE_API_TOKEN="$(printf '%s' "$CF_TOKEN" | tr -d '[:space:]')"
+          export CLOUDFLARE_ACCOUNT_ID="$(printf '%s' "$CF_ACCOUNT" | tr -d '[:space:]')"
+          node --max-old-space-size=6000 scripts/stormycast-run.mjs --deploy
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.STORMYCAST_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_TOKEN: ${{ secrets.STORMYCAST_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
