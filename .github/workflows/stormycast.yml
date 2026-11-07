@@ -1,0 +1,34 @@
+# Runs Stormycast after each ECMWF run (00Z and 12Z) and publishes it to the `stormycast`
+# branch of the nexradar Cloudflare Pages project (https://stormycast.nexradar.pages.dev).
+# Needs the repository secrets CLOUDFLARE_API_TOKEN (Pages: Edit) and CLOUDFLARE_ACCOUNT_ID.
+name: Stormycast
+
+on:
+  schedule:
+    # ECMWF's open data is complete about 8 h after each run; GitHub may start a little late.
+    - cron: '40 8 * * *'
+    - cron: '40 20 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: stormycast
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install Wrangler
+        run: npm install -g wrangler@4
+      - name: Keep the days already published
+        run: node scripts/stormycast-pull.mjs
+      - name: Run Stormycast and publish
+        run: node --max-old-space-size=6000 scripts/stormycast-run.mjs --deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

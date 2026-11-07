@@ -1,0 +1,15 @@
+Stormycast model and forecasts
+Copyright (c) 2026 stormy_sound (Nexradar)
+
+The trained models (public/js/core/stormycast-model.mjs, public/js/core/stormycast-hrrr-model.mjs)
+and the forecasts Stormycast publishes (https://stormycast.nexradar.pages.dev) are licensed
+under the Creative Commons Attribution 4.0 International licence (CC BY 4.0):
+https://creativecommons.org/licenses/by/4.0/
+
+Attribution: "Stormycast by stormy_sound, Nexradar" with a link to https://nexradar.pages.dev
+(and say if you changed anything).
+
+The models were made with data from others, which keep their own terms:
+- ECMWF open data (IFS forecasts), © ECMWF, CC BY 4.0.
+- ERA5: contains modified Copernicus Climate Change Service information.
+- NOAA HRRR forecasts, GOES GLM lightning and Storm Prediction Center storm reports (public domain).
