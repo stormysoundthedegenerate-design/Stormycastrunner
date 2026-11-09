@@ -22,7 +22,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { decodeMessage } from '../public/js/core/grib2.mjs';
 import { environment, ENV_FEATURES, OUTLOOK_LEVELS, WIND_LEVELS } from '../public/js/core/severe-env.mjs';
-import { chanceOf, mapValue, STORMYCAST_HAZARDS } from '../public/js/core/stormycast.mjs';
+import { chanceOf, rawChance, calibrated, blurAt, mapValue, STORMYCAST_HAZARDS } from '../public/js/core/stormycast.mjs';
 import { rows as era5Rows } from './stormycast/era5.mjs';
 import { hrrrDay, hrrrHas, neighbourhoods } from './stormycast/hrrr.mjs';
 
@@ -160,26 +160,64 @@ const snapSteps = new Set();
 const rainSteps = new Set();
 for (const p of plan) for (let i = 0; i < NX; i++) { for (const w of SNAPS) snapSteps.add(stepOf(p, i, w)); rainSteps.add(p.s[i]); rainSteps.add(p.e[i]); }
 
-// Environments: for each day, each snapshot's features per point.
+// The day's rain comes down meanwhile.
+const rain = new Map();
+const rainDone = Promise.all([...rainSteps].map(async (s) => { rain.set(s, s === 0 ? new Float32Array(NP) : await field(RUN, s, 'tp')); }));
+
+// Land, or within a cell of it: the points scored.
+const nearLand = new Uint8Array(NP);
+for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) {
+  let m = 0;
+  for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+    const jj = Math.min(NY - 1, Math.max(0, j + dj));
+    const ii = (i + di + NX) % NX;
+    m = Math.max(m, lsm[jj * NX + ii]);
+  }
+  nearLand[j * NX + i] = m >= 0.5 ? 1 : 0;
+}
+// Environments are worked out only there and one cell beyond (the nearby maxes read it);
+// open sea is left out.
+const needEnv = new Uint8Array(NP);
+for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) {
+  if (!nearLand[j * NX + i]) continue;
+  for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+    const jj = j + dj;
+    if (jj >= 0 && jj < NY) needEnv[jj * NX + ((i + di + NX) % NX)] = 1;
+  }
+}
+
+// Environments: for each day, each snapshot's features per point. The next step's fields
+// are fetched while this one's are worked through.
 const NE = ENV_FEATURES.length;
 const env = plan.map(() => Object.fromEntries(SNAPS.map((w) => [w, new Float32Array(NP * NE).fill(NaN)])));
 const t0 = Date.now();
-for (const step of [...snapSteps].sort((x, y) => x - y)) {
+function stepFields(step) {
   const F = {};
   const jobs = [['sp', 'sp'], ['t2', '2t'], ['d2', '2d'], ['u10', '10u'], ['v10', '10v']].map(async ([k, p]) => { F[k] = await field(RUN, step, p); });
   for (const p of OUTLOOK_LEVELS) jobs.push(field(RUN, step, 't', p).then((a) => { F[`t${p}`] = a; }));
   for (const p of WIND_LEVELS) for (const k of ['q', 'u', 'v']) jobs.push(field(RUN, step, k, p).then((a) => { F[k + p] = a; }));
-  await Promise.all(jobs);
+  return Promise.all(jobs).then(() => F);
+}
+const stepList = [...snapSteps].sort((x, y) => x - y);
+let nextFields = stepFields(stepList[0]);
+for (let si = 0; si < stepList.length; si++) {
+  const step = stepList[si];
+  const F = await nextFields;
+  if (si + 1 < stepList.length) nextFields = stepFields(stepList[si + 1]);
+  nextFields?.catch(() => {});
   let n = 0;
+  let cols = 0;
   for (let d = 0; d < plan.length; d++) {
     for (const w of SNAPS) {
       const out = env[d][w];
       for (let i = 0; i < NX; i++) {
         if (stepOf(plan[d], i, w) !== step) continue;
+        // A breath now and then, so the next step's downloads keep moving.
+        if (++cols % 40 === 0) await new Promise((r) => setImmediate(r));
         for (let j = 0; j < NY; j++) {
           const k = j * NX + i;
-          // Sea far from land is left out (the models know only land).
-          const c = { ps: F.sp[k] / 100, zs: zs[k] / 9.80665, t2: F.t2[k], d2: F.d2[k], u10: F.u10[k], v10: F.v10[k], t: {}, q: {}, u: {}, v: {}, lat: latOf(j) };
+          if (!needEnv[k]) continue;
+          const c ={ ps: F.sp[k] / 100, zs: zs[k] / 9.80665, t2: F.t2[k], d2: F.d2[k], u10: F.u10[k], v10: F.v10[k], t: {}, q: {}, u: {}, v: {}, lat: latOf(j) };
           for (const p of OUTLOOK_LEVELS) c.t[p] = F[`t${p}`][k];
           for (const p of WIND_LEVELS) { c.q[p] = F[`q${p}`][k]; c.u[p] = F[`u${p}`][k]; c.v[p] = F[`v${p}`][k]; }
           const e = environment(c);
@@ -192,19 +230,44 @@ for (const step of [...snapSteps].sort((x, y) => x - y)) {
   }
   console.log(`step ${step}: ${n} environments (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
 }
-const rain = new Map();
-await Promise.all([...rainSteps].map(async (s) => { rain.set(s, s === 0 ? new Float32Array(NP) : await field(RUN, s, 'tp')); }));
+await rainDone;
 
-// Land, or within a cell of it.
-const nearLand = new Uint8Array(NP);
-for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) {
-  let m = 0;
-  for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
-    const jj = Math.min(NY - 1, Math.max(0, j + dj));
-    const ii = (i + di + NX) % NX;
-    m = Math.max(m, lsm[jj * NX + ii]);
+/**
+ * A Gaussian average of v over the points that have a value, each point with its own width
+ * σ(k) in km (0 leaves it as it is), out to 2.5σ — as stormycast-blur.mjs tuned it.
+ */
+function smooth(v, sigmaOf) {
+  const out = new Float32Array(NP).fill(NaN);
+  for (let j = 0; j < NY; j++) {
+    const lat = latOf(j);
+    const kmLon = 55.6 * Math.max(0.05, Math.cos((lat * Math.PI) / 180));
+    for (let i = 0; i < NX; i++) {
+      const k = j * NX + i;
+      if (!Number.isFinite(v[k])) continue;
+      const sigma = sigmaOf(k);
+      if (!(sigma > 0)) { out[k] = v[k]; continue; }
+      const rj = Math.ceil((2.5 * sigma) / 55.6);
+      const ri = Math.min(NX >> 1, Math.ceil((2.5 * sigma) / kmLon));
+      let s = 0;
+      let w = 0;
+      for (let dj = -rj; dj <= rj; dj++) {
+        const jj = j + dj;
+        if (jj < 0 || jj >= NY) continue;
+        const dy = dj * 55.6;
+        for (let di = -ri; di <= ri; di++) {
+          const vv = v[jj * NX + ((i + di + NX) % NX)];
+          if (!Number.isFinite(vv)) continue;
+          const d2 = dy * dy + (di * kmLon) ** 2;
+          if (d2 > 6.25 * sigma * sigma) continue;
+          const g = Math.exp(-d2 / (2 * sigma * sigma));
+          s += g * vv;
+          w += g;
+        }
+      }
+      out[k] = s / w;
+    }
   }
-  nearLand[j * NX + i] = m >= 0.5 ? 1 : 0;
+  return out;
 }
 
 const nbMax = (get) => {
@@ -304,6 +367,10 @@ for (let d = 0; d < plan.length; d++) {
   const x = new Float32Array(FEATURES.length);
   const xl = new Float32Array(FEATURES.length);
   const t1 = Date.now();
+  // Raw chances first (the trees), then each smoothed over its neighbours (the model's σ for
+  // the point's lead, land points only), then calibrated for that lead and held under thunder.
+  const rawP = models.map(() => new Float32Array(NP).fill(NaN));
+  const thunder = new Int16Array(NP).fill(-1);
   for (let k = 0; k < NP; k++) {
     if (!nearLand[k] || !Number.isFinite(A[k * NE]) || !Number.isFinite(B[k * NE])) continue;
     for (let f = 0; f < FEATURES.length; f++) {
@@ -312,17 +379,26 @@ for (let d = 0; d < plan.length; d++) {
     }
     // ECMWF's values on ERA5's scale, as the models were taught.
     for (let f = 0; f < FEATURES.length; f++) x[f] = mapValue(maps[f], raw[f]);
-    // Calibrated for how far ahead this point's afternoon is.
     const lead = plan[d].a[k % NX];
-    for (let m = 0; m < models.length; m++) if (models[m]) out[m * NP + k] = Math.round(100 * chanceOf(models[m], x, lead));
+    for (let m = 0; m < models.length; m++) if (models[m]) rawP[m][k] = rawChance(models[m], x);
     if (LTG) {
       for (let f = 0; f < FEATURES.length; f++) xl[f] = mapValue(ltgMaps[f], raw[f]);
-      const t = Math.round(100 * chanceOf(LTG, xl, lead));
-      out[models.length * NP + k] = t;
-      for (let m = 0; m < models.length; m++) if (out[m * NP + k] > t) out[m * NP + k] = t;
+      thunder[k] = Math.round(100 * chanceOf(LTG, xl, lead));
     }
-    if (PROBE.has(k)) console.log(`probe ${PROBE.get(k)} day ${d}:`, HAZARDS.map((h, m) => `${h} ${out[m * NP + k]}%`).join(' '), '\n ', FEATURES.map((f, i) => `${f}=${+x[i].toFixed(1)}`).join(' '));
+    if (PROBE.has(k)) console.log(`probe ${PROBE.get(k)} day ${d}: raw`, HAZARDS.map((h, m) => `${h} ${m < models.length ? (100 * rawP[m][k]).toFixed(1) : thunder[k]}%`).join(' '), '\n ', FEATURES.map((f, i) => `${f}=${+x[i].toFixed(1)}`).join(' '));
   }
+  for (let m = 0; m < models.length; m++) {
+    if (!models[m]) continue;
+    const sm = smooth(rawP[m], (k) => blurAt(models[m], plan[d].a[k % NX]));
+    for (let k = 0; k < NP; k++) {
+      if (!Number.isFinite(sm[k])) continue;
+      let v = Math.round(100 * calibrated(models[m], sm[k], plan[d].a[k % NX]));
+      if (thunder[k] >= 0 && v > thunder[k]) v = thunder[k];
+      out[m * NP + k] = v;
+    }
+  }
+  if (LTG) for (let k = 0; k < NP; k++) if (thunder[k] >= 0) out[models.length * NP + k] = thunder[k];
+  for (const [k, name] of PROBE) console.log(`probe ${name} day ${d}:`, HAZARDS.map((h, m) => `${h} ${out[m * NP + k]}%`).join(' '));
   const hr = await hrrrChances(plan[d].D).catch((err) => { console.log('HRRR:', err.message); return null; });
   if (hr) {
     for (let p = 0; p < us.length; p++) {

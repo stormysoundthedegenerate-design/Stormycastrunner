@@ -46,13 +46,31 @@ function onCurve(c, p) {
  * they really are.
  */
 export function chanceOf(model, x, lead = null) {
+  return calibrated(model, rawChance(model, x), lead);
+}
+
+/** A model's raw chance (0–1) from its trees, before calibration. */
+export function rawChance(model, x) {
   let z = model.base;
   for (const t of model.trees) {
     let n = t[0];
     while (n.length === 4) { const v = x[n[0]]; n = t[v <= n[1] || Number.isNaN(v) ? n[2] : n[3]]; }
     z += n[0];
   }
-  const p = 1 / (1 + Math.exp(-z));
+  return 1 / (1 + Math.exp(-z));
+}
+
+/** A model's smoothing width (km) at a lead (hours): its `blur` pairs, linear between; 0 if none. */
+export function blurAt(model, lead) {
+  const b = model.blur;
+  if (!b?.length) return 0;
+  if (lead <= b[0][0]) return b[0][1];
+  for (let i = 1; i < b.length; i++) if (lead <= b[i][0]) return b[i - 1][1] + ((lead - b[i - 1][0]) / (b[i][0] - b[i - 1][0])) * (b[i][1] - b[i - 1][1]);
+  return b.at(-1)[1];
+}
+
+/** A raw chance through the model's calibration for that lead. */
+export function calibrated(model, p, lead = null) {
   const cs = model.curves;
   if (lead == null || !cs?.length) return onCurve(model.curve, p);
   if (lead <= cs[0][0]) return onCurve(cs[0][1], p);
