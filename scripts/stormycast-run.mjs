@@ -340,9 +340,24 @@ async function hrrrChances(D) {
     const NFH = HRRR_MODEL.features.length;
     const out = new Uint8Array(hrrrModels.length * us.length);
     const x = new Float32Array(NFH);
+    // Raw chances first, then (as ECMWF's) smoothed over the US points by the model's σ for
+    // this run's lead (hours to the day's afternoon snapshot), then calibrated.
+    const rawH = hrrrModels.map((m) => (m ? new Float64Array(us.length) : null));
     for (let p = 0; p < us.length; p++) {
       for (let q = 0; q < NFH; q++) x[q] = X[p * NFH + q];
-      for (let m = 0; m < hrrrModels.length; m++) if (hrrrModels[m]) out[m * us.length + p] = Math.round(100 * chanceOf(hrrrModels[m], x));
+      for (let m = 0; m < hrrrModels.length; m++) if (hrrrModels[m]) rawH[m][p] = rawChance(hrrrModels[m], x);
+    }
+    for (let m = 0; m < hrrrModels.length; m++) {
+      if (!hrrrModels[m]) continue;
+      const sigma = blurAt(hrrrModels[m], f0 + 9);
+      let v = rawH[m];
+      if (sigma > 0) {
+        const full = new Float32Array(NP).fill(NaN);
+        for (let p = 0; p < us.length; p++) full[us[p].k] = v[p];
+        const sm = smooth(full, () => sigma);
+        v = us.map(({ k }) => sm[k]);
+      }
+      for (let p = 0; p < us.length; p++) out[m * us.length + p] = Math.round(100 * calibrated(hrrrModels[m], v[p]));
     }
     return { run, f0, out };
   }
