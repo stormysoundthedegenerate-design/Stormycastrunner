@@ -22,7 +22,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { decodeMessage } from '../public/js/core/grib2.mjs';
 import { environment, ENV_FEATURES, OUTLOOK_LEVELS, WIND_LEVELS } from '../public/js/core/severe-env.mjs';
-import { chanceOf, rawChance, calibrated, blurAt, mapValue, STORMYCAST_HAZARDS } from '../public/js/core/stormycast.mjs';
+import { chanceOf, rawChance, calibrated, blurAt, mapValue, ingredientIndex, ceilingAt, STORMYCAST_HAZARDS } from '../public/js/core/stormycast.mjs';
 import { rows as era5Rows } from './stormycast/era5.mjs';
 import { hrrrDay, hrrrHas, neighbourhoods } from './stormycast/hrrr.mjs';
 
@@ -160,9 +160,15 @@ const snapSteps = new Set();
 const rainSteps = new Set();
 for (const p of plan) for (let i = 0; i < NX; i++) { for (const w of SNAPS) snapSteps.add(stepOf(p, i, w)); rainSteps.add(p.s[i]); rainSteps.add(p.e[i]); }
 
-// The day's rain comes down meanwhile.
+// The day's rain comes down meanwhile; and for the correction layers, ECMWF's convective
+// rain (its run total) at each point's day start and end, 3 h before its afternoon and 9 h after.
 const rain = new Map();
 const rainDone = Promise.all([...rainSteps].map(async (s) => { rain.set(s, s === 0 ? new Float32Array(NP) : await field(RUN, s, 'tp')); }));
+const TOPUP_CP = Object.values(STORMYCAST_MODEL.models).some((m) => m?.topup);
+const cpSteps = new Set();
+if (TOPUP_CP) for (const p of plan) for (let i = 0; i < NX; i++) for (const s of [p.s[i], p.e[i], onStep(Math.max(0, p.a[i] - 3)), onStep(p.a[i] + 9)]) cpSteps.add(s);
+const cpRun = new Map();
+const cpDone = Promise.all([...cpSteps].map(async (s) => { cpRun.set(s, s === 0 ? new Float32Array(NP) : await field(RUN, s, 'cp').catch(() => null)); }));
 
 // Land, or within a cell of it: the points scored.
 const nearLand = new Uint8Array(NP);
@@ -191,8 +197,18 @@ for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) {
 const NE = ENV_FEATURES.length;
 const env = plan.map(() => Object.fromEntries(SNAPS.map((w) => [w, new Float32Array(NP * NE).fill(NaN)])));
 const t0 = Date.now();
+// ECMWF's own fields at each snapshot step, for the correction layers (topup): its MUCAPE,
+// 700 hPa vertical velocity and gust; null where a run has none (older runs lack some).
+const TOPUP = Object.values(STORMYCAST_MODEL.models).some((m) => m?.topup);
+const own = new Map(); // step -> { mucape, w700, fg }
+const ownJobs = [];
 function stepFields(step) {
   const F = {};
+  if (TOPUP) {
+    const o = {};
+    own.set(step, o);
+    for (const [k, p, l] of [['mucape', 'mucape'], ['w700', 'w', 700], ['fg', '10fg']]) ownJobs.push(field(RUN, step, p, l ?? null).then((a) => { o[k] = a; }, () => { o[k] = null; }));
+  }
   const jobs = [['sp', 'sp'], ['t2', '2t'], ['d2', '2d'], ['u10', '10u'], ['v10', '10v']].map(async ([k, p]) => { F[k] = await field(RUN, step, p); });
   for (const p of OUTLOOK_LEVELS) jobs.push(field(RUN, step, 't', p).then((a) => { F[`t${p}`] = a; }));
   for (const p of WIND_LEVELS) for (const k of ['q', 'u', 'v']) jobs.push(field(RUN, step, k, p).then((a) => { F[k + p] = a; }));
@@ -231,6 +247,8 @@ for (let si = 0; si < stepList.length; si++) {
   console.log(`step ${step}: ${n} environments (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
 }
 await rainDone;
+await cpDone;
+await Promise.all(ownJobs);
 
 /**
  * A Gaussian average of v over the points that have a value, each point with its own width
@@ -342,6 +360,8 @@ const PROBE = new Map((process.env.STORMYCAST_PROBE || '').split(';').filter(Boo
 const LTG = STORMYCAST_MODEL.models.ltg || null;
 const ltgMaps = LTG ? FEATURES.map((f) => LTG.maps?.[f]) : null;
 const HAZARDS = LTG ? [...STORMYCAST_HAZARDS, 'thunder'] : STORMYCAST_HAZARDS;
+// Each input's place by name.
+const FEATURE_AT = Object.fromEntries(FEATURES.map((f, i) => [f, i]));
 // Where each input comes from: [snapshot, env index] | 'rain' | 'nb_rain' | ['nb', k].
 const SOURCE = FEATURES.map((f) => {
   const m = /^([abmn])_(.+)$/.exec(f);
@@ -371,16 +391,39 @@ for (let d = 0; d < plan.length; d++) {
   // the point's lead, land points only), then calibrated for that lead and held under thunder.
   const rawP = models.map(() => new Float32Array(NP).fill(NaN));
   const thunder = new Int16Array(NP).fill(-1);
+  // Each point's ingredient indexes, for the models' ceilings (ceilingAt).
+  const ingr = { stp: new Float32Array(NP), wmaxshear: new Float32Array(NP) };
+  const byName = (name) => raw[FEATURE_AT[name]];
+  // The correction layers' inputs (stormycast/maps.mjs EXTRA, worked out as the saved maps
+  // were): ECMWF's own fields at the point's snapshots and its convective rain windows.
+  const topupFeatures = models.find((m) => m?.topup)?.topup.features || null;
+  const xt = topupFeatures ? new Float32Array(topupFeatures.length) : null;
+  const ownAt = (w, key, k, i) => { const o = own.get(stepOf(plan[d], i, w)); return o?.[key] ? o[key][k] : NaN; };
+  const cpAt = (s, k) => { const a = cpRun.get(s); return a ? a[k] : NaN; };
+  const before = (i) => onStep(Math.max(0, plan[d].a[i] - 3));
+  const after = (i) => onStep(plan[d].a[i] + 9);
+  const EXTRA_OF = {
+    ec_mucape_a: (k, i) => ownAt('a', 'mucape', k, i), ec_mucape_b: (k, i) => ownAt('b', 'mucape', k, i),
+    ec_mucape_m: (k, i) => ownAt('m', 'mucape', k, i), ec_mucape_n: (k, i) => ownAt('n', 'mucape', k, i),
+    ec_cp_before: (k, i) => Math.max(0, (cpAt(before(i), k) - cpAt(plan[d].s[i], k)) * 1000),
+    ec_cp_storm: (k, i) => Math.max(0, (cpAt(after(i), k) - cpAt(before(i), k)) * 1000),
+    ec_cp_day: (k, i) => Math.max(0, (cpAt(plan[d].e[i], k) - cpAt(plan[d].s[i], k)) * 1000),
+    ec_w700_a: (k, i) => ownAt('a', 'w700', k, i), ec_w700_b: (k, i) => ownAt('b', 'w700', k, i),
+    ec_fg_a: (k, i) => ownAt('a', 'fg', k, i), ec_fg_b: (k, i) => ownAt('b', 'fg', k, i),
+  };
   for (let k = 0; k < NP; k++) {
     if (!nearLand[k] || !Number.isFinite(A[k * NE]) || !Number.isFinite(B[k * NE])) continue;
     for (let f = 0; f < FEATURES.length; f++) {
       const s = SOURCE[f];
       raw[f] = s === 'rain' ? cp[k] : s === 'nb_rain' ? nbcp[k] : s[0] === 'nb' ? nb[s[1]][k] : E[s[0]][k * NE + s[1]];
     }
+    ingr.stp[k] = ingredientIndex('stp', byName);
+    ingr.wmaxshear[k] = ingredientIndex('wmaxshear', byName);
     // ECMWF's values on ERA5's scale, as the models were taught.
     for (let f = 0; f < FEATURES.length; f++) x[f] = mapValue(maps[f], raw[f]);
     const lead = plan[d].a[k % NX];
-    for (let m = 0; m < models.length; m++) if (models[m]) rawP[m][k] = rawChance(models[m], x);
+    if (xt) for (let f = 0; f < xt.length; f++) { const name = topupFeatures[f]; xt[f] = name in FEATURE_AT ? raw[FEATURE_AT[name]] : EXTRA_OF[name](k, k % NX); }
+    for (let m = 0; m < models.length; m++) if (models[m]) rawP[m][k] = rawChance(models[m], x, xt);
     if (LTG) {
       for (let f = 0; f < FEATURES.length; f++) xl[f] = mapValue(ltgMaps[f], raw[f]);
       thunder[k] = Math.round(100 * chanceOf(LTG, xl, lead));
@@ -394,6 +437,9 @@ for (let d = 0; d < plan.length; d++) {
       if (!Number.isFinite(sm[k])) continue;
       let v = Math.round(100 * calibrated(models[m], sm[k], plan[d].a[k % NX]));
       if (thunder[k] >= 0 && v > thunder[k]) v = thunder[k];
+      // No more than the point's ingredients carry on US forecast days.
+      const ceil = models[m].ceiling;
+      if (ceil) v = Math.min(v, Math.round(100 * ceilingAt(models[m], ingr[ceil.index][k])));
       out[m * NP + k] = v;
     }
   }

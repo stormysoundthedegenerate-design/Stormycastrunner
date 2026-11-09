@@ -49,14 +49,26 @@ export function chanceOf(model, x, lead = null) {
   return calibrated(model, rawChance(model, x), lead);
 }
 
-/** A model's raw chance (0–1) from its trees, before calibration. */
-export function rawChance(model, x) {
-  let z = model.base;
-  for (const t of model.trees) {
+/** The sum of a list of trees' leaves for one input vector. */
+function treeSum(trees, x) {
+  let z = 0;
+  for (const t of trees) {
     let n = t[0];
     while (n.length === 4) { const v = x[n[0]]; n = t[v <= n[1] || Number.isNaN(v) ? n[2] : n[3]]; }
     z += n[0];
   }
+  return z;
+}
+
+/**
+ * A model's raw chance (0–1) from its trees, before calibration. A model with a correction
+ * layer (`topup`, scripts/stormycast-topup.mjs: small trees fitted on ECMWF forecast days to
+ * what the main trees get wrong, reading inputs of their own) adds it when given its inputs
+ * (`xt`, in topup.features' order, unmapped); without them, the main trees alone.
+ */
+export function rawChance(model, x, xt = null) {
+  let z = model.base + treeSum(model.trees, x);
+  if (model.topup && xt) z += treeSum(model.topup.trees, xt);
   return 1 / (1 + Math.exp(-z));
 }
 
@@ -67,6 +79,32 @@ export function blurAt(model, lead) {
   if (lead <= b[0][0]) return b[0][1];
   for (let i = 1; i < b.length; i++) if (lead <= b[i][0]) return b[i - 1][1] + ((lead - b[i - 1][0]) / (b[i][0] - b[i - 1][0])) * (b[i][1] - b[i - 1][1]);
   return b.at(-1)[1];
+}
+
+/**
+ * A point's ingredient index, from its inputs by name (`f(name)`, as ECMWF gives them, not
+ * mapped): 'stp', the day's greatest STP at the point or within 60 km; 'wmaxshear',
+ * √(2·MUCAPE) × 0–6 km shear from the day's greatest of each (m²/s²).
+ */
+export function ingredientIndex(index, f) {
+  const mx = (names) => { let m = 0; for (const n of names) { const v = f(n); if (Number.isFinite(v) && v > m) m = v; } return m; };
+  if (index === 'stp') return mx(['a_stp', 'b_stp', 'm_stp', 'n_stp', 'nb_stp']);
+  const cape = mx(['a_mucape', 'b_mucape', 'm_mucape', 'n_mucape', 'nb_mucape']);
+  const shear = mx(['a_shr6', 'b_shr6', 'm_shr6', 'n_shr6', 'nb_shr6']);
+  return Math.sqrt(2 * cape) * shear;
+}
+
+/**
+ * The most a model's chance may be at a point with this ingredient index (its `ceiling`,
+ * from scripts/stormycast-ceilings.mjs: what US forecast days at that index can carry); 1
+ * for a model without one.
+ */
+export function ceilingAt(model, v) {
+  const c = model.ceiling;
+  if (!c) return 1;
+  let b = 0;
+  while (b < c.edges.length && v >= c.edges[b]) b++;
+  return c.values[b];
 }
 
 /** A raw chance through the model's calibration for that lead. */
