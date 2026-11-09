@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { decodeMessage } from '../public/js/core/grib2.mjs';
 import { environment, ENV_FEATURES, OUTLOOK_LEVELS, WIND_LEVELS } from '../public/js/core/severe-env.mjs';
 import { chanceOf, rawChance, calibrated, blurAt, mapValue, ingredientIndex, ceilingAt, STORMYCAST_HAZARDS } from '../public/js/core/stormycast.mjs';
+import { gustFactorAt } from '../public/js/core/stormycast-gust.mjs';
 import { rows as era5Rows } from './stormycast/era5.mjs';
 import { hrrrDay, hrrrHas, neighbourhoods } from './stormycast/hrrr.mjs';
 
@@ -375,6 +376,10 @@ const PROBE = new Map((process.env.STORMYCAST_PROBE || '').split(';').filter(Boo
 const LTG = STORMYCAST_MODEL.models.ltg || null;
 const ltgMaps = LTG ? FEATURES.map((f) => LTG.maps?.[f]) : null;
 const HAZARDS = LTG ? [...STORMYCAST_HAZARDS, 'thunder'] : STORMYCAST_HAZARDS;
+// The wind models' places, and each point's gust factor (1 over the US and far from the tropics).
+const WIND_MODELS = new Set(['wind', 'sigwind'].map((h) => STORMYCAST_HAZARDS.indexOf(h)).filter((m) => m >= 0));
+const gustFactor = new Float32Array(NP);
+for (let k = 0; k < NP; k++) gustFactor[k] = gustFactorAt(90 - Math.floor(k / NX) * 0.5, -180 + (k % NX) * 0.5);
 // Each input's place by name.
 const FEATURE_AT = Object.fromEntries(FEATURES.map((f, i) => [f, i]));
 // Where each input comes from: [snapshot, env index] | 'rain' | 'nb_rain' | ['nb', k].
@@ -455,6 +460,9 @@ for (let d = 0; d < plan.length; d++) {
       // No more than the point's ingredients carry on US forecast days.
       const ceil = models[m].ceiling;
       if (ceil) v = Math.min(v, Math.round(100 * ceilingAt(models[m], ingr[ceil.index][k])));
+      // Wind outside the US: scaled by how often thunderstorms there bring measured damaging
+      // gusts (core/stormycast-gust.mjs, from airport reports).
+      if (WIND_MODELS.has(m)) v = Math.round(v * gustFactor[k]);
       out[m * NP + k] = v;
     }
   }

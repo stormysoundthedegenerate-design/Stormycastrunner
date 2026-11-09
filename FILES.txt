@@ -1,11 +1,13 @@
-Packed 2026-11-09T05:26:58.717Z by scripts/stormycast-runner-pack.mjs
+Packed 2026-11-09T22:14:37.714Z by scripts/stormycast-runner-pack.mjs
 
 public/js/core/aec.mjs
+public/js/core/contour-areas.mjs
 public/js/core/grib2.mjs
 public/js/core/hrrr-zarr.mjs
 public/js/core/j2k.mjs
 public/js/core/ml-outlooks.mjs
 public/js/core/severe-env.mjs
+public/js/core/stormycast-gust.mjs
 public/js/core/stormycast-hrrr-model.mjs
 public/js/core/stormycast-model.mjs
 public/js/core/stormycast.mjs
