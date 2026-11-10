@@ -181,9 +181,12 @@ async function dayBytes(base, entry) {
   return days.get(key);
 }
 
-/** The viewer's date n − 1 days on, as YYYYMMDD. */
+/**
+ * The viewer's date n − 1 days on, as YYYYMMDD. Stormycast's days run 6 am to 6 am, so
+ * until 6 am the viewer is still in yesterday's.
+ */
 function dateOf(day) {
-  const d = new Date(Date.now() + (day - 1) * 864e5);
+  const d = new Date(Date.now() - 6 * 3600e3 + (day - 1) * 864e5);
   return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
 }
 

@@ -6,6 +6,7 @@ How it's built:
 - Gradient-boosted trees learn from the storm environments of US severe days.
 - A thunder stage first asks whether there will be thunderstorms at all, in the style of ASTORP. It's trained on GOES lightning.
 - The trees then run on ECMWF's open forecasts and NOAA's GEFS ensemble worldwide (mixed by how well each has done, hazard by hazard and day by day), and on HRRR over the US for day 1.
+- Outside the US, tropical wind chances are scaled by airport gust records.
 - Each run is scored once the days are over, against SPC's storm reports and beside SPC's own outlook (`scores.json` on the published site).
 
 This repository runs Stormycast twice a day on GitHub Actions (`.github/workflows/stormycast.yml`). It publishes each run to <https://stormycast.nexradar.pages.dev>, which the Nexradar app (<https://nexradar.pages.dev>) reads.
