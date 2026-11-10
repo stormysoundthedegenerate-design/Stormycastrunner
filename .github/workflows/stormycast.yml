@@ -14,10 +14,15 @@ concurrency:
   group: stormycast
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: write # only for the keep-alive step below
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # ECMWF, five GEFS members and HRRR: about 30-60 minutes.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -36,3 +41,11 @@ jobs:
         env:
           CF_TOKEN: ${{ secrets.STORMYCAST_TOKEN }}
           CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # GitHub pauses a public repository's scheduled workflows after 60 days without a
+      # commit; Stormycast publishes to Cloudflare and never commits, so each run switches
+      # its own schedule back on.
+      - name: Keep the schedule alive
+        if: always()
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/stormycast.yml/enable" || true
+        env:
+          GH_TOKEN: ${{ github.token }}

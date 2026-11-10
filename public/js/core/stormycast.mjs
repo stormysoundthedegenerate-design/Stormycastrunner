@@ -204,7 +204,7 @@ async function stormycastAreas(day, kindId) {
     // Stored north row first; the lattice wants the south row first.
     const z = new Float32Array(nx * ny);
     for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) z[j * nx + i] = bytes[h * nx * ny + (ny - 1 - j) * nx + i];
-    areas = latticeAreas(z, nx, ny, kind.levels, { west, south, east: west + (nx - 1) * step, north: south + (ny - 1) * step }, step, 3);
+    areas = latticeAreas(z, nx, ny, kind.levels, { west, south, east: west + (nx - 1) * step, north: south + (ny - 1) * step }, step, 3, { offset: 0.5, round: 3 });
     areasKept.set(key, areas);
     if (areasKept.size > 24) areasKept.delete(areasKept.keys().next().value);
   }
@@ -228,5 +228,5 @@ export const STORMYCAST = {
   days: 5,
   kinds: KINDS.map(({ id, label }) => ({ id, label })),
   load: stormycastAreas,
-  credit: 'Stormycast by stormy_sound, Nexradar: NOAA HRRR over the US; GOES GLM lightning; ECMWF open data (CC BY 4.0); contains modified Copernicus Climate Change Service information (ERA5); SPC storm reports',
+  credit: 'Stormycast by stormy_sound, Nexradar: NOAA GEFS and, over the US, HRRR; GOES GLM lightning; ECMWF open data (CC BY 4.0); contains modified Copernicus Climate Change Service information (ERA5); SPC storm reports',
 };

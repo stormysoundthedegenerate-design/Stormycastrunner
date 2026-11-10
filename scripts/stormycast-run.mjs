@@ -182,6 +182,22 @@ for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) {
   }
   nearLand[j * NX + i] = m >= 0.5 ? 1 : 0;
 }
+// The points given severe chances: land (ERA5 land fraction ≥ 0.5), and an island too small
+// to have such a cell (≥ 0.2 with no ≥ 0.5 cell around it). Coastal sea gets none: its own
+// environment (warm water, strong flow) is not where the reports come from, and smoothed
+// in it would spread offshore chances onto the coast. Thunder still covers coastal sea.
+const onLand = new Uint8Array(NP);
+for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) {
+  const k = j * NX + i;
+  if (lsm[k] >= 0.5) { onLand[k] = 1; continue; }
+  if (lsm[k] < 0.2) continue;
+  let big = false;
+  for (let dj = -1; dj <= 1 && !big; dj++) for (let di = -1; di <= 1; di++) {
+    const jj = j + dj;
+    if (jj >= 0 && jj < NY && lsm[jj * NX + ((i + di + NX) % NX)] >= 0.5) { big = true; break; }
+  }
+  if (!big) onLand[k] = 1;
+}
 // Environments are worked out only there and one cell beyond (the nearby maxes read it);
 // open sea is left out.
 const needEnv = new Uint8Array(NP);
@@ -216,37 +232,46 @@ function stepFields(step) {
   return Promise.all(jobs).then(() => F);
 }
 const stepList = [...snapSteps].sort((x, y) => x - y);
-let nextFields = stepFields(stepList[0]);
-for (let si = 0; si < stepList.length; si++) {
-  const step = stepList[si];
-  const F = await nextFields;
-  if (si + 1 < stepList.length) nextFields = stepFields(stepList[si + 1]);
-  nextFields?.catch(() => {});
-  let n = 0;
-  let cols = 0;
-  for (let d = 0; d < plan.length; d++) {
-    for (const w of SNAPS) {
-      const out = env[d][w];
-      for (let i = 0; i < NX; i++) {
-        if (stepOf(plan[d], i, w) !== step) continue;
-        // A breath now and then, so the next step's downloads keep moving.
-        if (++cols % 40 === 0) await new Promise((r) => setImmediate(r));
-        for (let j = 0; j < NY; j++) {
-          const k = j * NX + i;
-          if (!needEnv[k]) continue;
-          const c ={ ps: F.sp[k] / 100, zs: zs[k] / 9.80665, t2: F.t2[k], d2: F.d2[k], u10: F.u10[k], v10: F.v10[k], t: {}, q: {}, u: {}, v: {}, lat: latOf(j) };
-          for (const p of OUTLOOK_LEVELS) c.t[p] = F[`t${p}`][k];
-          for (const p of WIND_LEVELS) { c.q[p] = F[`q${p}`][k]; c.u[p] = F[`u${p}`][k]; c.v[p] = F[`v${p}`][k]; }
-          const e = environment(c);
-          if (!e) continue;
-          for (let f = 0; f < NE; f++) out[k * NE + f] = e[ENV_FEATURES[f]];
-          n++;
+/**
+ * Fills `out` (each day's snapshots' environments at the points that need them) from the
+ * fields `load(step)` gives (sp, t2, d2, u10, v10, t<level>, q/u/v<level>), the next step's
+ * fetched while this one's are worked through. ECMWF's and each GEFS member's alike.
+ */
+async function environments(load, out, label) {
+  for (const day of out) for (const w of SNAPS) day[w].fill(NaN);
+  let nextFields = load(stepList[0]);
+  for (let si = 0; si < stepList.length; si++) {
+    const step = stepList[si];
+    const F = await nextFields;
+    if (si + 1 < stepList.length) nextFields = load(stepList[si + 1]);
+    nextFields?.catch(() => {});
+    let n = 0;
+    let cols = 0;
+    for (let d = 0; d < plan.length; d++) {
+      for (const w of SNAPS) {
+        const o = out[d][w];
+        for (let i = 0; i < NX; i++) {
+          if (stepOf(plan[d], i, w) !== step) continue;
+          // A breath now and then, so the next step's downloads keep moving.
+          if (++cols % 40 === 0) await new Promise((r) => setImmediate(r));
+          for (let j = 0; j < NY; j++) {
+            const k = j * NX + i;
+            if (!needEnv[k]) continue;
+            const c = { ps: F.sp[k] / 100, zs: zs[k] / 9.80665, t2: F.t2[k], d2: F.d2[k], u10: F.u10[k], v10: F.v10[k], t: {}, q: {}, u: {}, v: {}, lat: latOf(j) };
+            for (const p of OUTLOOK_LEVELS) c.t[p] = F[`t${p}`][k];
+            for (const p of WIND_LEVELS) { c.q[p] = F[`q${p}`][k]; c.u[p] = F[`u${p}`][k]; c.v[p] = F[`v${p}`][k]; }
+            const e = environment(c);
+            if (!e) continue;
+            for (let f = 0; f < NE; f++) o[k * NE + f] = e[ENV_FEATURES[f]];
+            n++;
+          }
         }
       }
     }
+    if (label === 'ECMWF' || si === stepList.length - 1) console.log(`${label} step ${step}: ${n} environments (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
   }
-  console.log(`step ${step}: ${n} environments (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
 }
+await environments(stepFields, env, 'ECMWF');
 await rainDone;
 await cpDone;
 await Promise.all(ownJobs);
@@ -324,9 +349,11 @@ if (HRRR_MODEL) {
   const full = Math.max(...hoods.map((h) => h.r100.length));
   cand.forEach((c, n) => { if (hoods[n].r20.length) us.push({ ...c, hood: hoods[n], w: Math.min(1, Math.max(0, (hoods[n].r100.length / full - 0.6) / 0.3)) }); });
 }
-// EF2+ tornadoes stay with the ECMWF model over the US too: HRRR's held-back Brier skill for
-// them was ~0 (2026-11-07 fit) against ECMWF's 0.04.
-const HRRR_SKIP = new Set(['sigtor']);
+// EF2+ tornadoes and 2 in+ hail stay with ECMWF (and GEFS) over the US too: HRRR's models
+// for them have next to no skill on days they never learnt from (sigtor ~0 in the 2026-11-07
+// fit; sighail 0.012 against Nadocast's 0.156 on 26 held-back days, 2026-11-10, where
+// ECMWF's day 1 scored 0.06 on the larger check).
+const HRRR_SKIP = new Set(['sigtor', 'sighail']);
 const hrrrModels = HRRR_MODEL ? STORMYCAST_HAZARDS.map((h) => (HRRR_SKIP.has(h) ? null : HRRR_MODEL.models[h])) : [];
 /** The US day (12Z on D to 12Z next) from the newest HRRR run that covers it (48 h runs). */
 async function hrrrChances(D) {
@@ -364,6 +391,145 @@ async function hrrrChances(D) {
   }
   return null;
 }
+
+// --- GEFS (core/stormycast-gefs-model.mjs) ------------------------------------------------------
+// NOAA's ensemble, the same cycle as ECMWF's run: its first members (gec00, gep01…), each
+// through the GEFS model (trained on the GEFSv12 reforecast) at the same snapshots and days,
+// their raw chances averaged, smoothed and calibrated for the lead, then mixed with ECMWF's
+// by the share the model holds for each hazard and lead (scripts/stormycast-gefs-blend.mjs).
+// Left out (ECMWF alone) if the model has no mix yet, the run is not out, or --no-gefs.
+let GEFS = null;
+if (!args.includes('--no-gefs')) {
+  try {
+    const G = (await import('../public/js/core/stormycast-gefs-model.mjs')).STORMYCAST_GEFS_MODEL;
+    if (G.models.tor?.weight) GEFS = G;
+  } catch { /* not fitted */ }
+}
+/** [day][model] Float32Array of calibrated GEFS chances (NaN where none), or null. */
+async function gefsChances() {
+  const { gefsOpsGrid, gefsOpsHas, gefsFetched } = await import('./stormycast/gefs.mjs');
+  const members = ['gec00', ...Array.from({ length: (GEFS.members || 5) - 1 }, (_, k) => `gep${String(k + 1).padStart(2, '0')}`)];
+  const lastStep = Math.max(...stepList, ...plan.flatMap((p) => [...p.e, ...[...p.a].map((a) => a + 9)]));
+  if (!(await gefsOpsHas(RUN, members.at(-1), Math.ceil(lastStep / 3) * 3))) { console.log('GEFS: this cycle is not out yet; ECMWF alone'); return null; }
+  const GF = GEFS.features;
+  const GM = STORMYCAST_HAZARDS.map((h) => GEFS.models[h]);
+  // Where each input comes from: as ECMWF's SOURCE, or a GEFS field of its own.
+  const OWN = { g_cape: 'gefs_cape', g_cin: 'gefs_cin', g_hlcy: 'gefs_hlcy', g_pwat: 'gefs_pwat', g_hpbl: 'gefs_hpbl', g_gust: 'gefs_gust' };
+  const GSRC = GF.map((f) => {
+    const m = /^([abmn])_(.+)$/.exec(f);
+    if (m && ENV_FEATURES.includes(m[2])) return [m[1], ENV_FEATURES.indexOf(m[2])];
+    if (f === 'rain' || f === 'nb_rain') return f;
+    if (f.startsWith('nb_')) return ['nb', NB.indexOf(f.slice(3))];
+    const o = /^(g_[a-z]+)_([ab])$/.exec(f);
+    if (o && OWN[o[1]]) return ['own', OWN[o[1]], o[2]];
+    if (f.startsWith('g_cp_')) return ['cp', f.slice(5)];
+    throw new Error(`unknown GEFS input ${f}`);
+  });
+  const MUCAPE = ENV_FEATURES.indexOf('mucape');
+  let skipped = 0;
+  let treed = 0;
+  const genv = plan.map(() => Object.fromEntries(SNAPS.map((w) => [w, new Float32Array(NP * NE)])));
+  const sum = plan.map(() => GM.map(() => new Float32Array(NP)));
+  const cnt = plan.map(() => new Uint8Array(NP));
+  const x = new Float32Array(GF.length);
+  const t1 = Date.now();
+  let used = 0;
+  for (const member of members) {
+    const cache = new Map();
+    const memo = new Map();
+    const grid = (field, fh, level = null) => {
+      const key = `${field}:${fh}:${level}`;
+      if (!memo.has(key)) memo.set(key, gefsOpsGrid(field, fh, level, RUN, member, cache).then((a) => { if (!a) throw new Error(`GEFS ${member} has no ${field} ${level ?? ''} at ${fh} h`); return a; }));
+      return memo.get(key);
+    };
+    // The environment's own fields, let go once their step is worked out.
+    const ENV_FIELDS = new Set(['surface_pressure', '2m_temperature', '2m_dewpoint_temperature', '10m_u_component_of_wind', '10m_v_component_of_wind', 'temperature', 'specific_humidity', 'u_component_of_wind', 'v_component_of_wind']);
+    const load = async (step) => {
+      const F = {};
+      const jobs = [['sp', 'surface_pressure'], ['t2', '2m_temperature'], ['d2', '2m_dewpoint_temperature'], ['u10', '10m_u_component_of_wind'], ['v10', '10m_v_component_of_wind']].map(async ([k, f]) => { F[k] = await grid(f, step); });
+      for (const p of OUTLOOK_LEVELS) jobs.push(grid('temperature', step, p).then((a) => { F[`t${p}`] = a; }));
+      for (const p of WIND_LEVELS) for (const [k, f] of [['q', 'specific_humidity'], ['u', 'u_component_of_wind'], ['v', 'v_component_of_wind']]) jobs.push(grid(f, step, p).then((a) => { F[k + p] = a; }));
+      await Promise.all(jobs);
+      // The step's environment fields are not needed again (rain and GEFS's own come separately).
+      for (const key of [...memo.keys()]) { const [f, s] = key.split(':'); if (ENV_FIELDS.has(f) && s === String(step)) memo.delete(key); }
+      return F;
+    };
+    try {
+      // Every other field the days need, fetched together while the environments are worked
+      // out (one at a time they waited on the network for most of a member's time).
+      const wanted = new Set();
+      for (const p of plan) {
+        for (let i = 0; i < NX; i++) {
+          for (const f of Object.values(OWN)) { wanted.add(`${f}|${stepOf(p, i, 'a')}`); wanted.add(`${f}|${stepOf(p, i, 'b')}`); }
+          for (const s of [p.s[i], Math.max(0, p.a[i] - 3), p.a[i] + 9, p.e[i]]) wanted.add(`convective_precipitation|${s}`);
+          wanted.add(`total_precipitation|${p.s[i]}`); wanted.add(`total_precipitation|${p.e[i]}`);
+        }
+      }
+      const others = Promise.all([...wanted].map((w) => { const [f, s] = w.split('|'); return grid(f, +s); }));
+      others.catch(() => {});
+      await environments(load, genv, `GEFS ${member}`);
+      await others;
+      for (let d = 0; d < plan.length; d++) {
+        const p = plan[d];
+        const E = genv[d];
+        // The day's rain and the nearby maxes, as ECMWF's.
+        const tp = new Float32Array(NP);
+        for (let i = 0; i < NX; i++) {
+          const [s, e] = await Promise.all([grid('total_precipitation', p.s[i]), grid('total_precipitation', p.e[i])]);
+          for (let j = 0; j < NY; j++) { const k = j * NX + i; tp[k] = Math.max(0, (e[k] - s[k]) * 1000); }
+        }
+        const nbtp = nbMax((k) => tp[k]);
+        const nb = NB.map((f) => { const fi = ENV_FEATURES.indexOf(f); return nbMax((k) => { const a = E.a[k * NE + fi]; const b = E.b[k * NE + fi]; return Math.max(Number.isFinite(a) ? a : -Infinity, Number.isFinite(b) ? b : -Infinity); }); });
+        for (let i = 0; i < NX; i++) {
+          const sa = stepOf(p, i, 'a');
+          const sb = stepOf(p, i, 'b');
+          const own = {};
+          for (const f of Object.values(OWN)) own[f] = { a: await grid(f, sa), b: await grid(f, sb) };
+          const cpAt = await Promise.all([p.s[i], Math.max(0, p.a[i] - 3), p.a[i] + 9, p.e[i]].map((s) => grid('convective_precipitation', s)));
+          for (let j = 0; j < NY; j++) {
+            const k = j * NX + i;
+            if (!onLand[k] || !Number.isFinite(E.a[k * NE]) || !Number.isFinite(E.b[k * NE])) continue;
+            const cp = (u, v) => Math.max(0, (cpAt[v][k] - cpAt[u][k]) * 1000);
+            cnt[d][k]++;
+            // No instability all day (MUCAPE under 25 J/kg at every snapshot and nearby): the
+            // trees would give ~0, so they are skipped (most land, most of the year; the bulk
+            // of the time GEFS takes otherwise).
+            let cape = nb[NB.indexOf('mucape')][k];
+            for (const w of SNAPS) { const v = E[w][k * NE + MUCAPE]; if (v > cape) cape = v; }
+            if (!(cape >= 25)) { skipped++; continue; }
+            treed++;
+            for (let f = 0; f < GF.length; f++) {
+              const s = GSRC[f];
+              x[f] = s === 'rain' ? tp[k] : s === 'nb_rain' ? nbtp[k] : s[0] === 'nb' ? nb[s[1]][k]
+                : s[0] === 'own' ? own[s[1]][s[2]][k]
+                  : s[0] === 'cp' ? (s[1] === 'before' ? cp(0, 1) : s[1] === 'storm' ? cp(1, 2) : cp(0, 3))
+                    : E[s[0]][k * NE + s[1]];
+            }
+            for (let m = 0; m < GM.length; m++) sum[d][m][k] += rawChance(GM[m], x);
+          }
+          if (i % 60 === 59) await new Promise((r) => setImmediate(r));
+        }
+      }
+      used++;
+      console.log(`GEFS ${member} done (${((Date.now() - t1) / 1000).toFixed(0)} s, ${(gefsFetched() / 1e9).toFixed(1)} GB so far, memory ${(process.memoryUsage().rss / 1e9).toFixed(1)} GB; trees at ${treed} point-days, ${skipped} skipped with no CAPE)`);
+    } catch (err) {
+      // A member's sums are already mixed in, and the calibration expects every member: this
+      // run goes out on ECMWF alone.
+      console.log(`GEFS ${member} failed (${err.message}); ECMWF alone this run`);
+      return null;
+    }
+  }
+  // Averaged, smoothed and calibrated for each point's lead.
+  const out = plan.map((p, d) => GM.map((model) => {
+    const mean = new Float32Array(NP).fill(NaN);
+    for (let k = 0; k < NP; k++) if (cnt[d][k] === used) mean[k] = sum[d][GM.indexOf(model)][k] / used;
+    const sm = smooth(mean, (k) => blurAt(model, p.a[k % NX]));
+    return sm.map((v, k) => (Number.isFinite(v) ? calibrated(model, v, p.a[k % NX]) : NaN));
+  }));
+  console.log(`GEFS: ${used} members in ${((Date.now() - t1) / 1000).toFixed(0)} s`);
+  return out;
+}
+const gefsDays = GEFS ? await gefsChances().catch((err) => { console.log('GEFS failed:', err.message); return null; }) : null;
 
 // STORMYCAST_PROBE="lat,lon;lat,lon" prints those points' inputs and chances.
 const PROBE = new Map((process.env.STORMYCAST_PROBE || '').split(';').filter(Boolean).map((s) => {
@@ -443,7 +609,8 @@ for (let d = 0; d < plan.length; d++) {
     for (let f = 0; f < FEATURES.length; f++) x[f] = mapValue(maps[f], raw[f]);
     const lead = plan[d].a[k % NX];
     if (xt) for (let f = 0; f < xt.length; f++) { const name = topupFeatures[f]; xt[f] = name in FEATURE_AT ? raw[FEATURE_AT[name]] : EXTRA_OF[name](k, k % NX); }
-    for (let m = 0; m < models.length; m++) if (models[m]) rawP[m][k] = rawChance(models[m], x, xt);
+    // Severe chances over land only (onLand); thunder over coastal sea too.
+    if (onLand[k]) for (let m = 0; m < models.length; m++) if (models[m]) rawP[m][k] = rawChance(models[m], x, xt);
     if (LTG) {
       for (let f = 0; f < FEATURES.length; f++) xl[f] = mapValue(ltgMaps[f], raw[f]);
       thunder[k] = Math.round(100 * chanceOf(LTG, xl, lead));
@@ -455,7 +622,14 @@ for (let d = 0; d < plan.length; d++) {
     const sm = smooth(rawP[m], (k) => blurAt(models[m], plan[d].a[k % NX]));
     for (let k = 0; k < NP; k++) {
       if (!Number.isFinite(sm[k])) continue;
-      let v = Math.round(100 * calibrated(models[m], sm[k], plan[d].a[k % NX]));
+      let pr = calibrated(models[m], sm[k], plan[d].a[k % NX]);
+      // Mixed with GEFS's by its share for this hazard and lead.
+      const g = gefsDays?.[d][m][k];
+      if (g != null && Number.isFinite(g)) {
+        const w = blurAt({ blur: GEFS.models[STORMYCAST_HAZARDS[m]].weight }, plan[d].a[k % NX]);
+        pr = (1 - w) * pr + w * g;
+      }
+      let v = Math.round(100 * pr);
       if (thunder[k] >= 0 && v > thunder[k]) v = thunder[k];
       // No more than the point's ingredients carry on US forecast days.
       const ceil = models[m].ceiling;
@@ -472,6 +646,7 @@ for (let d = 0; d < plan.length; d++) {
   if (hr) {
     for (let p = 0; p < us.length; p++) {
       const { k, w } = us[p];
+      if (!onLand[k]) continue;
       for (let m = 0; m < models.length; m++) if (hrrrModels[m]) out[m * NP + k] = Math.round(w * hr.out[m * us.length + p] + (1 - w) * out[m * NP + k]);
     }
     console.log(`  US from HRRR ${new Date(hr.run).toISOString().slice(0, 13)}Z, hours ${hr.f0 + 1}–${hr.f0 + 24}`);
@@ -479,7 +654,7 @@ for (let d = 0; d < plan.length; d++) {
   const date = new Date(plan[d].D).toISOString().slice(0, 10).replace(/-/g, '');
   const file = `${date}-${runName}.bin.gz`;
   writeFileSync(join(SITE, file), gzipSync(out, { level: 9 }));
-  entries.push({ date, run: new Date(RUN).toISOString(), file, hazards: HAZARDS, ...(hr ? { hrrr: new Date(hr.run).toISOString() } : {}) });
+  entries.push({ date, run: new Date(RUN).toISOString(), file, hazards: HAZARDS, ...(hr ? { hrrr: new Date(hr.run).toISOString() } : {}), ...(gefsDays ? { gefs: GEFS.members || 5 } : {}) });
   const top = HAZARDS.map((h, m) => `${h} ${out.subarray(m * NP, (m + 1) * NP).reduce((a, v) => (v > a ? v : a), 0)}%`).join(', ');
   console.log(`${date}: ${file} (${((Date.now() - t1) / 1000).toFixed(0)} s; highest ${top})`);
 }
@@ -502,6 +677,15 @@ writeFileSync(join(SITE, '_headers'), '/*\n  Access-Control-Allow-Origin: *\n  C
 writeFileSync(join(SITE, '404.html'), '<!doctype html><meta charset="utf-8"><title>Not found</title><p>Not found.</p>\n');
 writeFileSync(join(SITE, 'index.html'), '<!doctype html><meta charset="utf-8"><title>Stormycast</title><p>Stormycast severe outlooks, for <a href="https://nexradar.pages.dev/">Nexradar</a>.</p>\n');
 console.log('wrote site-data/stormycast/site');
+
+// The scorecard (stormycast-score.mjs): this run's days noted at the US scoring points, and
+// the days now over scored against SPC's reports. A failure here never stops the publishing.
+if (!args.includes('--no-score')) {
+  try {
+    const { scoreStormycast } = await import('./stormycast-score.mjs');
+    await scoreStormycast(SITE);
+  } catch (err) { console.log('scoring failed:', err.message); }
+}
 
 if (args.includes('--deploy')) {
   writeFileSync(join(DIR, 'wrangler.jsonc'), '// Stormycast\'s days (scripts/stormycast-run.mjs --deploy): site/, deployed as the\n'

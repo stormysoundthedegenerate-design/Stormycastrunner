@@ -1,4 +1,4 @@
-Packed 2026-11-09T22:14:37.714Z by scripts/stormycast-runner-pack.mjs
+Packed 2026-11-10T04:56:01.508Z by scripts/stormycast-runner-pack.mjs
 
 public/js/core/aec.mjs
 public/js/core/contour-areas.mjs
@@ -7,6 +7,7 @@ public/js/core/hrrr-zarr.mjs
 public/js/core/j2k.mjs
 public/js/core/ml-outlooks.mjs
 public/js/core/severe-env.mjs
+public/js/core/stormycast-gefs-model.mjs
 public/js/core/stormycast-gust.mjs
 public/js/core/stormycast-hrrr-model.mjs
 public/js/core/stormycast-model.mjs
@@ -18,7 +19,10 @@ public/js/render/model-overlay.mjs
 public/vendor/jpx/jpx.mjs
 public/vendor/openjpeg/openjpegwasm_decode.js
 scripts/stormycast-run.mjs
+scripts/stormycast-score.mjs
 scripts/stormycast/era5.mjs
+scripts/stormycast/gefs.mjs
 scripts/stormycast/hrrr.mjs
+scripts/stormycast/score-points.mjs
 site-data/stormycast/zs.f32
 site-data/stormycast/lsm.f32

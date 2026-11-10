@@ -52,11 +52,32 @@ function simplify(ring, tol) {
 }
 
 /**
+ * A closed ring's corners cut round (Chaikin): each pass keeps a quarter and three quarters
+ * of the way along every side, so after a few the outline is a smooth curve.
+ */
+function rounded(ring, passes) {
+  let pts = ring.slice(0, -1);
+  for (let k = 0; k < passes; k++) {
+    const out = [];
+    for (let i = 0; i < pts.length; i++) {
+      const [x0, y0] = pts[i];
+      const [x1, y1] = pts[(i + 1) % pts.length];
+      out.push([+(0.75 * x0 + 0.25 * x1).toFixed(3), +(0.75 * y0 + 0.25 * y1).toFixed(3)], [+(0.25 * x0 + 0.75 * x1).toFixed(3), +(0.25 * y0 + 0.75 * y1).toFixed(3)]);
+    }
+    pts = out;
+  }
+  return [...pts, pts[0]];
+}
+
+/**
  * Where a lattice is at or above a level, as polygons with their holes: marching squares
  * on the lattice framed in nothing (so every outline closes), the pieces stitched by the
  * cell edges they share, then each outline put inside the one around it.
  */
-function fill(p, W, H, L, lon, lat, minArea) {
+function fill(p, W, H, level, lon, lat, minArea, opts = {}) {
+  // Whole-number data (percent) is outlined half a step below the level, so no line runs
+  // through a point that is exactly on it (no slivers or zero-width spikes).
+  const L = level - (opts.offset || 0);
   const v = (i, j) => p[j * W + i];
   const at = (a, b) => (L - a) / (b - a || 1e-9);
   const segs = [];
@@ -104,7 +125,8 @@ function fill(p, W, H, L, lon, lat, minArea) {
   }
   // Nesting: an outline inside an even number of others bounds an area, inside an odd
   // number a hole in the one just around it.
-  const kept = rings.map((r) => simplify(r, 0.02)).filter((r) => r.length >= 4 && Math.abs(area(r)) >= minArea);
+  const kept = rings.map((r) => simplify(r, 0.02)).filter((r) => r.length >= 4 && Math.abs(area(r)) >= minArea)
+    .map((r) => (opts.round ? rounded(r, opts.round) : r));
   const depth = kept.map((r, k) => kept.reduce((n, o, m) => n + (m !== k && inside(r[0], o) ? 1 : 0), 0));
   const polys = [];
   const outerOf = new Map();
@@ -127,8 +149,12 @@ function fill(p, W, H, L, lon, lat, minArea) {
   return polys;
 }
 
-/** The same from a lattice already made: `z` row by row from the south-west corner. */
-export function latticeAreas(z, nx, ny, levels, box, step, minCells = 2) {
+/**
+ * The same from a lattice already made: `z` row by row from the south-west corner.
+ * opts.offset: outline that much below each level (0.5 for whole-number data);
+ * opts.round: passes of corner rounding (3 makes smooth curves).
+ */
+export function latticeAreas(z, nx, ny, levels, box, step, minCells = 2, opts = {}) {
   const W = nx + 2;
   const H = ny + 2;
   const p = new Float32Array(W * H);
@@ -140,6 +166,6 @@ export function latticeAreas(z, nx, ny, levels, box, step, minCells = 2) {
   }
   const lon = (x) => +(box.west + (x - 1) * step).toFixed(3);
   const lat = (y) => +(box.south + (y - 1) * step).toFixed(3);
-  return levels.map(([L, colour]) => [L, colour, fill(p, W, H, L, lon, lat, step * step * minCells)]);
+  return levels.map(([L, colour]) => [L, colour, fill(p, W, H, L, lon, lat, step * step * minCells, opts)]);
 }
 

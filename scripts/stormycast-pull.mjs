@@ -27,6 +27,11 @@ for (const e of doc.days || []) {
   writeFileSync(join(SITE, e.file), b);
   n++;
 }
+// The scorecard and its notes of earlier runs (stormycast-score.mjs) carry on from run to run.
+for (const name of ['scores.json', 'score-pending.json']) {
+  const f = await fetch(`${BASE}/${name}`, { cache: 'no-store', signal: AbortSignal.timeout(60000) }).catch(() => null);
+  if (f?.ok) { writeFileSync(join(SITE, name), Buffer.from(await f.arrayBuffer())); console.log('pulled', name); }
+}
 // Only days whose file came down are kept.
 writeFileSync(join(SITE, 'latest.json'), JSON.stringify(doc));
 console.log(`pulled ${n} of ${(doc.days || []).length} days (run ${doc.run})`);
