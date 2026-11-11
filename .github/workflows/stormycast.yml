@@ -57,7 +57,7 @@ jobs:
           node-version: 24
       - name: Work out GEFS ${{ matrix.member }}
         run: node --max-old-space-size=6000 scripts/stormycast-run.mjs ${{ needs.prep.outputs.run }} --gefs-member=${{ matrix.member }} --gefs-out=gefs-parts --no-score
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gefs-${{ matrix.member }}
           path: gefs-parts/
@@ -84,7 +84,7 @@ jobs:
         run: node scripts/stormycast-pull.mjs
       - name: Take the GEFS members' parts
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: gefs-*
           path: gefs-parts
