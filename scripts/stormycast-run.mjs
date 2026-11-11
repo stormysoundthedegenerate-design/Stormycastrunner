@@ -16,7 +16,7 @@
 // `stormycast` branch of the nexradar Pages project (apart from the app's own deployment).
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
-import { gzipSync } from 'node:zlib';
+import { gzipSync, gunzipSync } from 'node:zlib';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,7 +30,7 @@ import { hrrrDay, hrrrHas, neighbourhoods } from './stormycast/hrrr.mjs';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const DIR = join(root, 'site-data/stormycast');
-const SITE = join(DIR, 'site');
+const SITE = process.env.STORMYCAST_SITE || join(DIR, 'site'); // a test run can write elsewhere
 mkdirSync(SITE, { recursive: true });
 const { STORMYCAST_MODEL } = await import('../public/js/core/stormycast-model.mjs');
 const FEATURES = STORMYCAST_MODEL.features;
@@ -134,6 +134,15 @@ const runDate = Math.floor(RUN / 864e5) * 864e5;
 const NDAYS = 5;
 const DATES = Array.from({ length: NDAYS }, (_, k) => k).map((k) => runDate + (new Date(RUN).getUTCHours() === 0 ? k : k + 1) * 864e5);
 console.log('run', runName, 'days', DATES.map((d) => new Date(d).toISOString().slice(0, 10)).join(' '));
+// Splitting the run over several machines (the GitHub workflow): --print-run just names the
+// run (YYYYMMDDHH) for the other jobs; --gefs-member=NAME --gefs-out=DIR works out one GEFS
+// member's raw chances alone and leaves them in DIR; the main run, --gefs-from=DIR, reads the
+// members it finds there and works out any missing itself.
+const argOpt = (k) => args.find((a) => a.startsWith(`--${k}=`))?.slice(k.length + 3);
+if (args.includes('--print-run')) { console.log(`RUN=${runName}`); process.exit(0); }
+const GEFS_MEMBER = argOpt('gefs-member') || null;
+const GEFS_OUT = argOpt('gefs-out') || null;
+const GEFS_FROM = argOpt('gefs-from') || null;
 
 // Each point's steps, day by day.
 // ECMWF's open steps: every 3 h to 144 h, every 6 h after.
@@ -164,7 +173,7 @@ for (const p of plan) for (let i = 0; i < NX; i++) { for (const w of SNAPS) snap
 // The day's rain comes down meanwhile; and for the correction layers, ECMWF's convective
 // rain (its run total) at each point's day start and end, 3 h before its afternoon and 9 h after.
 const rain = new Map();
-const rainDone = Promise.all([...rainSteps].map(async (s) => { rain.set(s, s === 0 ? new Float32Array(NP) : await field(RUN, s, 'tp')); }));
+const rainDone = GEFS_MEMBER ? Promise.resolve() : Promise.all([...rainSteps].map(async (s) => { rain.set(s, s === 0 ? new Float32Array(NP) : await field(RUN, s, 'tp')); }));
 const TOPUP_CP = Object.values(STORMYCAST_MODEL.models).some((m) => m?.topup);
 const cpSteps = new Set();
 if (TOPUP_CP) for (const p of plan) for (let i = 0; i < NX; i++) for (const s of [p.s[i], p.e[i], onStep(Math.max(0, p.a[i] - 3)), onStep(p.a[i] + 9)]) cpSteps.add(s);
@@ -271,7 +280,7 @@ async function environments(load, out, label) {
     if (label === 'ECMWF' || si === stepList.length - 1) console.log(`${label} step ${step}: ${n} environments (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
   }
 }
-await environments(stepFields, env, 'ECMWF');
+if (!GEFS_MEMBER) await environments(stepFields, env, 'ECMWF');
 await rainDone;
 await cpDone;
 await Promise.all(ownJobs);
@@ -349,11 +358,15 @@ if (HRRR_MODEL) {
   const full = Math.max(...hoods.map((h) => h.r100.length));
   cand.forEach((c, n) => { if (hoods[n].r20.length) us.push({ ...c, hood: hoods[n], w: Math.min(1, Math.max(0, (hoods[n].r100.length / full - 0.6) / 0.3)) }); });
 }
-// EF2+ tornadoes and 2 in+ hail stay with ECMWF (and GEFS) over the US too: HRRR's models
-// for them have next to no skill on days they never learnt from (sigtor ~0 in the 2026-11-07
-// fit; sighail 0.012 against Nadocast's 0.156 on 26 held-back days, 2026-11-10, where
-// ECMWF's day 1 scored 0.06 on the larger check).
-const HRRR_SKIP = new Set(['sigtor', 'sighail']);
+// 2 in+ hail stays with ECMWF (and GEFS) over the US: HRRR's model scores 0.072 on its 364
+// unseen days (2026-11-10), about what ECMWF's does, but the two are not yet compared on the
+// same days. EF2+ tornadoes are mostly HRRR's (HRRR_SHARE): on the 27 unseen days both cover,
+// HRRR's scored 0.14 against ECMWF's 0.05 (three quarters HRRR 0.13), and it puts EF2+ where
+// HRRR puts the storms rather than 150–200 km off where the coarse models' air is best.
+const HRRR_SKIP = new Set(['sighail']);
+const HRRR_SHARE = { sigtor: 0.75 };
+// A significant hazard is never let above its own kind (EF2+ above any tornado, and so on).
+const PARENT = { sigtor: 'tor', sighail: 'hail', sigwind: 'wind' };
 const hrrrModels = HRRR_MODEL ? STORMYCAST_HAZARDS.map((h) => (HRRR_SKIP.has(h) ? null : HRRR_MODEL.models[h])) : [];
 /** The US day (12Z on D to 12Z next) from the newest HRRR run that covers it (48 h runs). */
 async function hrrrChances(D) {
@@ -408,7 +421,11 @@ if (!args.includes('--no-gefs')) {
 /** [day][model] Float32Array of calibrated GEFS chances (NaN where none), or null. */
 async function gefsChances() {
   const { gefsOpsGrid, gefsOpsHas, gefsFetched } = await import('./stormycast/gefs.mjs');
-  const members = ['gec00', ...Array.from({ length: (GEFS.members || 5) - 1 }, (_, k) => `gep${String(k + 1).padStart(2, '0')}`)];
+  const all = ['gec00', ...Array.from({ length: (GEFS.members || 5) - 1 }, (_, k) => `gep${String(k + 1).padStart(2, '0')}`)];
+  const members = GEFS_MEMBER ? [GEFS_MEMBER] : all;
+  // A member's saved part (from a --gefs-member job): this run's days' raw sums, then which points were worked out.
+  const partFile = (dir, member) => join(dir, `gefs-${runName}-${member}.f32.gz`);
+  const PART = plan.length * (STORMYCAST_HAZARDS.length + 1) * NP;
   const lastStep = Math.max(...stepList, ...plan.flatMap((p) => [...p.e, ...[...p.a].map((a) => a + 9)]));
   if (!(await gefsOpsHas(RUN, members.at(-1), Math.ceil(lastStep / 3) * 3))) { console.log('GEFS: this cycle is not out yet; ECMWF alone'); return null; }
   const GF = GEFS.features;
@@ -435,6 +452,27 @@ async function gefsChances() {
   const t1 = Date.now();
   let used = 0;
   for (const member of members) {
+    const mSum = plan.map(() => GM.map(() => new Float32Array(NP)));
+    const mCnt = plan.map(() => new Uint8Array(NP));
+    const take = () => {
+      for (let d = 0; d < plan.length; d++) {
+        for (let m = 0; m < GM.length; m++) { const a = sum[d][m]; const b = mSum[d][m]; for (let k = 0; k < NP; k++) a[k] += b[k]; }
+        for (let k = 0; k < NP; k++) cnt[d][k] += mCnt[d][k];
+      }
+      used++;
+    };
+    if (GEFS_FROM && existsSync(partFile(GEFS_FROM, member))) {
+      const buf = gunzipSync(readFileSync(partFile(GEFS_FROM, member)));
+      const v = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
+      if (v.length === PART) {
+        let o = 0;
+        for (let d = 0; d < plan.length; d++) { for (let m = 0; m < GM.length; m++) { mSum[d][m].set(v.subarray(o, o + NP)); o += NP; } for (let k = 0; k < NP; k++) mCnt[d][k] = v[o + k]; o += NP; }
+        take();
+        console.log(`GEFS ${member}: from its own job`);
+        continue;
+      }
+      console.log(`GEFS ${member}: its saved part doesn't fit this run; working it out here`);
+    }
     const cache = new Map();
     const memo = new Map();
     const grid = (field, fh, level = null) => {
@@ -490,7 +528,7 @@ async function gefsChances() {
             const k = j * NX + i;
             if (!onLand[k] || !Number.isFinite(E.a[k * NE]) || !Number.isFinite(E.b[k * NE])) continue;
             const cp = (u, v) => Math.max(0, (cpAt[v][k] - cpAt[u][k]) * 1000);
-            cnt[d][k]++;
+            mCnt[d][k] = 1;
             // No instability all day (MUCAPE under 25 J/kg at every snapshot and nearby): the
             // trees would give ~0, so they are skipped (most land, most of the year; the bulk
             // of the time GEFS takes otherwise).
@@ -505,12 +543,19 @@ async function gefsChances() {
                   : s[0] === 'cp' ? (s[1] === 'before' ? cp(0, 1) : s[1] === 'storm' ? cp(1, 2) : cp(0, 3))
                     : E[s[0]][k * NE + s[1]];
             }
-            for (let m = 0; m < GM.length; m++) sum[d][m][k] += rawChance(GM[m], x);
+            for (let m = 0; m < GM.length; m++) mSum[d][m][k] = rawChance(GM[m], x);
           }
           if (i % 60 === 59) await new Promise((r) => setImmediate(r));
         }
       }
-      used++;
+      take();
+      if (GEFS_OUT) {
+        mkdirSync(GEFS_OUT, { recursive: true });
+        const v = new Float32Array(PART);
+        let o = 0;
+        for (let d = 0; d < plan.length; d++) { for (let m = 0; m < GM.length; m++) { v.set(mSum[d][m], o); o += NP; } v.set(mCnt[d], o); o += NP; }
+        writeFileSync(partFile(GEFS_OUT, member), gzipSync(Buffer.from(v.buffer), { level: 6 }));
+      }
       console.log(`GEFS ${member} done (${((Date.now() - t1) / 1000).toFixed(0)} s, ${(gefsFetched() / 1e9).toFixed(1)} GB so far, memory ${(process.memoryUsage().rss / 1e9).toFixed(1)} GB; trees at ${treed} point-days, ${skipped} skipped with no CAPE)`);
     } catch (err) {
       // A member's sums are already mixed in, and the calibration expects every member: this
@@ -530,6 +575,7 @@ async function gefsChances() {
   return out;
 }
 const gefsDays = GEFS ? await gefsChances().catch((err) => { console.log('GEFS failed:', err.message); return null; }) : null;
+if (GEFS_MEMBER) { console.log(`GEFS member ${GEFS_MEMBER} done`); process.exit(gefsDays ? 0 : 1); }
 
 // STORMYCAST_PROBE="lat,lon;lat,lon" prints those points' inputs and chances.
 const PROBE = new Map((process.env.STORMYCAST_PROBE || '').split(';').filter(Boolean).map((s) => {
@@ -647,9 +693,19 @@ for (let d = 0; d < plan.length; d++) {
     for (let p = 0; p < us.length; p++) {
       const { k, w } = us[p];
       if (!onLand[k]) continue;
-      for (let m = 0; m < models.length; m++) if (hrrrModels[m]) out[m * NP + k] = Math.round(w * hr.out[m * us.length + p] + (1 - w) * out[m * NP + k]);
+      for (let m = 0; m < models.length; m++) {
+        if (!hrrrModels[m]) continue;
+        const s = w * (HRRR_SHARE[STORMYCAST_HAZARDS[m]] ?? 1);
+        out[m * NP + k] = Math.round(s * hr.out[m * us.length + p] + (1 - s) * out[m * NP + k]);
+      }
     }
     console.log(`  US from HRRR ${new Date(hr.run).toISOString().slice(0, 13)}Z, hours ${hr.f0 + 1}–${hr.f0 + 24}`);
+  }
+  for (const [sig, parent] of Object.entries(PARENT)) {
+    const a = STORMYCAST_HAZARDS.indexOf(sig);
+    const b = STORMYCAST_HAZARDS.indexOf(parent);
+    if (a < 0 || b < 0) continue;
+    for (let k = 0; k < NP; k++) if (out[a * NP + k] > out[b * NP + k]) out[a * NP + k] = out[b * NP + k];
   }
   const date = new Date(plan[d].D).toISOString().slice(0, 10).replace(/-/g, '');
   const file = `${date}-${runName}.bin.gz`;

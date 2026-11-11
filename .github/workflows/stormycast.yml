@@ -1,6 +1,11 @@
 # Runs Stormycast after each ECMWF run (00Z and 12Z) and publishes it to the `stormycast`
 # branch of the nexradar Cloudflare Pages project (https://stormycast.nexradar.pages.dev).
 # Needs the repository secrets STORMYCAST_TOKEN (a Cloudflare API token, Pages: Edit) and CLOUDFLARE_ACCOUNT_ID.
+#
+# Split over several machines so the forecast comes out sooner: one job names the run, five
+# work out a GEFS member each at the same time, and the main job does ECMWF and HRRR, takes
+# the members' parts (working out any that failed itself) and publishes. Saving RRFS for
+# training runs on its own beside them and can never hold up or break the forecast.
 name: Stormycast
 
 on:
@@ -16,13 +21,58 @@ concurrency:
 
 permissions:
   contents: read
-  actions: write # only for the keep-alive step below
 
 jobs:
-  run:
+  prep:
     runs-on: ubuntu-latest
-    # ECMWF, five GEFS members and HRRR: about 30-60 minutes.
+    timeout-minutes: 15
+    outputs:
+      run: ${{ steps.run.outputs.run }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Name the run
+        id: run
+        run: |
+          RUN=$(node scripts/stormycast-run.mjs --print-run | sed -n 's/^RUN=//p')
+          echo "ECMWF run $RUN"
+          test -n "$RUN"
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+
+  gefs:
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        member: [gec00, gep01, gep02, gep03, gep04]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Work out GEFS ${{ matrix.member }}
+        run: node --max-old-space-size=6000 scripts/stormycast-run.mjs ${{ needs.prep.outputs.run }} --gefs-member=${{ matrix.member }} --gefs-out=gefs-parts --no-score
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gefs-${{ matrix.member }}
+          path: gefs-parts/
+          if-no-files-found: ignore
+          retention-days: 1
+
+  run:
+    needs: [prep, gefs]
+    if: ${{ always() && needs.prep.result == 'success' }}
+    runs-on: ubuntu-latest
+    # ECMWF and HRRR, plus any GEFS member whose own job failed.
     timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: write # only for the keep-alive step below
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -32,12 +82,19 @@ jobs:
         run: npm install -g wrangler@4
       - name: Keep the days already published
         run: node scripts/stormycast-pull.mjs
+      - name: Take the GEFS members' parts
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gefs-*
+          path: gefs-parts
+          merge-multiple: true
       - name: Run Stormycast and publish
         # Spaces or line breaks pasted in with the secrets are dropped.
         run: |
           export CLOUDFLARE_API_TOKEN="$(printf '%s' "$CF_TOKEN" | tr -d '[:space:]')"
           export CLOUDFLARE_ACCOUNT_ID="$(printf '%s' "$CF_ACCOUNT" | tr -d '[:space:]')"
-          node --max-old-space-size=6000 scripts/stormycast-run.mjs --deploy
+          node --max-old-space-size=6000 scripts/stormycast-run.mjs ${{ needs.prep.outputs.run }} --gefs-from=gefs-parts --deploy
         env:
           CF_TOKEN: ${{ secrets.STORMYCAST_TOKEN }}
           CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -49,3 +106,35 @@ jobs:
         run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/stormycast.yml/enable" || true
         env:
           GH_TOKEN: ${{ github.token }}
+
+  # RRFS (NOAA's new storm-scale model) and REFS (its ensemble) are kept for training a
+  # Stormycast model on them: NOMADS holds only their last two days, so each 00Z run's inputs
+  # at the US scoring points go to the rrfs-data branch. Runs already there are skipped.
+  rrfs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    permissions:
+      contents: write # only to add files to the rrfs-data branch
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Save RRFS and REFS for training
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch --depth=1 origin rrfs-data; then
+            git worktree add rrfs-data FETCH_HEAD
+            git -C rrfs-data switch -c rrfs-data
+          else
+            git worktree add --orphan -b rrfs-data rrfs-data
+          fi
+          node scripts/stormycast-rrfs-save.mjs rrfs-data || echo "RRFS save failed"
+          node scripts/stormycast-refs-save.mjs rrfs-data || echo "REFS save failed"
+          git -C rrfs-data add -A
+          if ! git -C rrfs-data diff --cached --quiet; then
+            git -C rrfs-data commit -q -m "RRFS $(date -u +%Y-%m-%d)"
+            git -C rrfs-data push origin rrfs-data
+          fi

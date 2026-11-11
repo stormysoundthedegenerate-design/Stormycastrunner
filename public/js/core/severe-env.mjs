@@ -21,6 +21,10 @@ export const ENV_FEATURES = [
   'sbcape', 'sbcin', 'mlcape', 'mlcin', 'mucape', 'mllcl', 'lapse75', 'lapse03', 'td2', 'pw', 'q850',
   'rh75', 'thetaeDrop', 'frz', 'shr1', 'shr3', 'shr6', 'srh1', 'srh3', 'wind850', 'wind500', 'wind10',
   'storm', 'stp', 'scp', 'elev',
+  // Hail (added 2026-11-10; models fitted before then don't read them): the most unstable
+  // parcel's CAPE where the air is −10 to −30 °C (the hail-growth layer) and the height of
+  // the wet-bulb zero above the ground (hail melts on the way down below it).
+  'hgzCape', 'wbz',
 ];
 
 const es = (t) => 6.112 * Math.exp((17.67 * (t - 273.15)) / (t - 29.65)); // hPa
@@ -103,10 +107,11 @@ export function environment(c) {
     const te = thetaE(t0, p0, r0, tl);
     let cape = 0;
     let cin = 0;
+    let hgz = 0; // the part of the CAPE where the air is −10 to −30 °C
     let lfc = false;
     let prev = null;
     for (let i = i0; i < col.length; i++) {
-      const { p, tv } = col[i];
+      const { p, tv, t } = col[i];
       let tvp;
       if (p >= pl) tvp = t0 * (p / p0) ** KAPPA * (1 + 0.608 * r0);
       else { const tp = moistT(te, p); tvp = tp * (1 + 0.608 * mix(es(tp), p)); }
@@ -114,11 +119,17 @@ export function environment(c) {
       if (prev) {
         const area = RD * ((b + prev.b) / 2) * Math.log(prev.p / p);
         if (!lfc && p < pl && b > 0) lfc = true;
-        if (lfc) { if (area > 0) cape += area; } else if (area < 0) cin += area;
+        if (lfc) {
+          if (area > 0) {
+            cape += area;
+            const tm = (t + prev.t) / 2;
+            if (tm <= 263.15 && tm >= 243.15) hgz += area;
+          }
+        } else if (area < 0) cin += area;
       }
-      prev = { p, b };
+      prev = { p, b, t };
     }
-    return { cape, cin: lfc ? Math.max(-500, cin) : -500, lcl: Math.max(0, zAgl(Math.min(p0, pl))) };
+    return { cape, hgz, cin: lfc ? Math.max(-500, cin) : -500, lcl: Math.max(0, zAgl(Math.min(p0, pl))) };
   };
   const sb = lift(0, ps, c.t2, q2 / (1 - q2));
   // Mixed layer: the lowest 100 hPa, θ and mixing ratio averaged.
@@ -147,6 +158,22 @@ export function environment(c) {
   let teMin = Infinity;
   for (let p = Math.min(700, ps - 50); p >= 500; p -= 25) teMin = Math.min(teMin, teAt(p));
   const thetaeDrop = teAt(ps) - teMin;
+  // The wet-bulb zero: the lowest height where the wet-bulb temperature (Stull 2011, from
+  // temperature and relative humidity) falls below 0 °C; 0 where it is below at the ground.
+  const wetBulb = (l) => {
+    const tc = l.t - 273.15;
+    const rh = Math.max(5, Math.min(99, 100 * Math.min(1, (l.q * l.p) / (0.622 + 0.378 * l.q) / es(l.t))));
+    return tc * Math.atan(0.151977 * Math.sqrt(rh + 8.313659)) + Math.atan(tc + rh) - Math.atan(rh - 1.676331)
+      + 0.00391838 * rh ** 1.5 * Math.atan(0.023101 * rh) - 4.686035;
+  };
+  let wbz = NaN;
+  let twPrev = wetBulb(col[0]);
+  if (twPrev <= 0) wbz = 0;
+  for (let i = 1; i < col.length && !Number.isFinite(wbz); i++) {
+    const tw = wetBulb(col[i]);
+    if (tw <= 0) wbz = col[i - 1].z + (twPrev / (twPrev - tw)) * (col[i].z - col[i - 1].z);
+    twPrev = tw;
+  }
   let frz = 0;
   for (let i = 1; i < col.length; i++) {
     if (col[i].t < 273.15) {
@@ -208,5 +235,6 @@ export function environment(c) {
     rh75, thetaeDrop, frz, shr1: shr(4), shr3: shr(12), shr6, srh1, srh3,
     wind850: sp(850), wind500: sp(500), wind10: Math.hypot(c.u10, c.v10), storm: Math.hypot(cx, cy),
     stp, scp, elev: c.zs,
+    hgzCape: mu.hgz, wbz,
   };
 }

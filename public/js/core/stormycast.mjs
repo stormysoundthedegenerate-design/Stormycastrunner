@@ -228,6 +228,7 @@ export const STORMYCAST = {
   id: 'stormycast',
   label: 'Stormycast',
   note: "Nexradar's own: chances within 25 mi, worldwide. Each place's own day.",
+  link: { href: 'https://stormycast.pages.dev', text: 'Open the Stormycast page ↗' },
   days: 5,
   kinds: KINDS.map(({ id, label }) => ({ id, label })),
   load: stormycastAreas,

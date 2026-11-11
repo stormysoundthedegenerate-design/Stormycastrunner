@@ -15,6 +15,21 @@ import { locator } from '../../public/js/lib/model-grid.mjs';
 import { HRRR_GRID } from '../../public/js/core/hrrr-zarr.mjs';
 
 const BASE = 'https://noaa-hrrr-bdp-pds.s3.amazonaws.com';
+// RRFS (NOAA's successor to HRRR and the NAM, operational from November 2026) puts out its
+// 3 km US fields on exactly HRRR's grid and under nearly the same names, so the same code
+// reads it once switched over (setCamSource('rrfs')): NOMADS keeps only its last two days,
+// and asks for no more than about two requests a second, so its requests are spaced out.
+const RRFS = 'https://nomads.ncep.noaa.gov/pub/data/nccf/com/rrfs/prod';
+const RRFS_NAMES = {
+  'HAIL:0.1 sigma level': 'HAIL:surface',
+  'MAXUVV:100-1000 mb above ground': 'MAXUVV:100-1000 mb',
+  'USTM:0-6000 m above ground': 'USTM:6000-0 m above ground',
+  'VSTM:0-6000 m above ground': 'VSTM:6000-0 m above ground',
+};
+const RRFS_PRESSURE = new Set(['TMP:700 mb', 'TMP:500 mb']); // in its pressure-level file
+let SOURCE = 'hrrr';
+/** Which storm-scale model the readers below take: 'hrrr' (default) or 'rrfs'. */
+export function setCamSource(name) { SOURCE = name; }
 const NX = HRRR_GRID.nx;
 const NY = HRRR_GRID.ny;
 const NP = NX * NY;
@@ -31,12 +46,22 @@ async function slot(fn) {
   active++;
   try { return await fn(); } finally { active--; waiting.shift()?.(); }
 }
+let nomadsNext = 0;
+async function paced() {
+  const wait = nomadsNext - Date.now();
+  nomadsNext = Math.max(Date.now(), nomadsNext) + 700;
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+}
 async function get(url, range, text = false) {
   let last;
+  const nomads = url.startsWith(RRFS);
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       return await slot(async () => {
-        const r = await fetch(url, { headers: range ? { Range: `bytes=${range[0]}-${range[1] - 1}` } : {}, signal: AbortSignal.timeout(90000) });
+        if (nomads) await paced();
+        const headers = range ? { Range: `bytes=${range[0]}-${range[1] - 1}` } : {};
+        if (nomads) headers['user-agent'] = 'Stormycast RRFS archive (paced, once a day)';
+        const r = await fetch(url, { headers, signal: AbortSignal.timeout(90000) });
         if (r.status === 404 || r.status === 403) return null;
         if (!r.ok) throw new Error(`HRRR ${r.status}`);
         if (text) return r.text();
@@ -48,13 +73,15 @@ async function get(url, range, text = false) {
   }
   throw last;
 }
-const fileOf = (run, f) => {
+const fileOf = (run, f, pressure = false) => {
   const d = new Date(run);
-  return `${BASE}/hrrr.${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}/conus/hrrr.t${pad(d.getUTCHours())}z.wrfsfcf${pad(f)}.grib2`;
+  const ymd = `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
+  if (SOURCE === 'rrfs') return `${RRFS}/rrfs.${ymd}/${pad(d.getUTCHours())}/rrfs.t${pad(d.getUTCHours())}z.${pressure ? 'prslev' : '2dfld'}.3km.f${pad(f, 3)}.conus.grib2`;
+  return `${BASE}/hrrr.${ymd}/conus/hrrr.t${pad(d.getUTCHours())}z.wrfsfcf${pad(f)}.grib2`;
 };
 const idxKept = new Map();
-async function idxOf(run, f) {
-  const url = fileOf(run, f);
+async function idxOf(run, f, pressure = false) {
+  const url = fileOf(run, f, pressure);
   if (!idxKept.has(url)) {
     idxKept.set(url, get(`${url}.idx`, null, true).then((t) => {
       if (!t) return null;
@@ -70,11 +97,13 @@ export async function hrrrHas(run, f) { return !!(await idxOf(run, f)); }
 
 /** A field (var:level, and a pattern for the time part) at a forecast hour, or null. */
 async function field(run, f, what, time = null) {
-  const idx = await idxOf(run, f);
+  let pressure = false;
+  if (SOURCE === 'rrfs') { what = RRFS_NAMES[what] || what; pressure = RRFS_PRESSURE.has(what); }
+  const idx = await idxOf(run, f, pressure);
   if (!idx) return null;
   const e = idx.find((x) => x.name.startsWith(`${what}:`) && (!time || time.test(x.name)));
   if (!e) return null;
-  const b = await get(fileOf(run, f), [e.start, e.end ?? e.start + 50e6]);
+  const b = await get(fileOf(run, f, pressure), [e.start, e.end ?? e.start + 50e6]);
   if (!b) return null;
   return decodeMessage(b).values;
 }
