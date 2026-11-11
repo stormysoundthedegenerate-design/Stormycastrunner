@@ -368,6 +368,32 @@ const HRRR_SHARE = { sigtor: 0.75 };
 // A significant hazard is never let above its own kind (EF2+ above any tornado, and so on).
 const PARENT = { sigtor: 'tor', sighail: 'hail', sigwind: 'wind' };
 const hrrrModels = HRRR_MODEL ? STORMYCAST_HAZARDS.map((h) => (HRRR_SKIP.has(h) ? null : HRRR_MODEL.models[h])) : [];
+// The consensus (scripts/stormycast-consensus.mjs), day 1 only: one small model per hazard
+// reads each source's smoothed chance at the point (ECMWF, the GEFS member mean and spread,
+// over the US HRRR) and gives one chance, for the hazards where it scored better than the
+// fixed shares (`use`). Off until its file exists.
+let CONSENSUS = null;
+try { CONSENSUS = (await import('../public/js/core/stormycast-consensus.mjs')).STORMYCAST_CONSENSUS; } catch { /* not fitted yet */ }
+const usAt = new Int32Array(NP).fill(-1);
+us.forEach((u, p) => { usAt[u.k] = p; });
+const logitOf = (p) => { const c = Math.min(1 - 1e-5, Math.max(1e-5, p)); return Math.log(c / (1 - c)); };
+const onCurveOf = (c, v) => {
+  for (let i = 1; i < c.length; i++) if (v <= c[i][0]) { const [x0, y0] = c[i - 1]; const [x1, y1] = c[i]; return x1 > x0 ? y0 + ((v - x0) / (x1 - x0)) * (y1 - y0) : y1; }
+  return c.at(-1)[1];
+};
+/** One consensus model's chance from v = { e, g, h, spread, pe, pg, ph } (smoothed raw chances). */
+function consensusChance(c, v) {
+  const src = c.names.filter((n) => /^l[egh]$/.test(n)).map((n) => n[1]);
+  const l = src.map((s) => logitOf(v[s]));
+  const row = [...l, ...l.map((a) => a * a)];
+  for (let a = 0; a < l.length; a++) for (let b = a + 1; b < l.length; b++) row.push(l[a] * l[b]);
+  row.push(Math.sqrt(v.spread));
+  if (c.names.length > row.length) for (const s of src) row.push(logitOf(v[`p${s}`]));
+  if (row.length !== c.names.length || row.some((a) => !Number.isFinite(a))) return NaN;
+  let z = c.beta[row.length];
+  for (let j = 0; j < row.length; j++) z += (c.beta[j] * (row[j] - c.mu[j])) / c.sd[j];
+  return onCurveOf(c.curve, 1 / (1 + Math.exp(-z)));
+}
 /** The US day (12Z on D to 12Z next) from the newest HRRR run that covers it (48 h runs). */
 async function hrrrChances(D) {
   if (!us.length) return null;
@@ -383,14 +409,17 @@ async function hrrrChances(D) {
     const x = new Float32Array(NFH);
     // Raw chances first, then (as ECMWF's) smoothed over the US points by the model's σ for
     // this run's lead (hours to the day's afternoon snapshot), then calibrated.
-    const rawH = hrrrModels.map((m) => (m ? new Float64Array(us.length) : null));
+    // Every hazard's (the consensus reads the skipped ones too); only the overlaid ones calibrated.
+    const allH = STORMYCAST_HAZARDS.map((h) => HRRR_MODEL.models[h] || null);
+    const rawH = allH.map((m) => (m ? new Float64Array(us.length) : null));
     for (let p = 0; p < us.length; p++) {
       for (let q = 0; q < NFH; q++) x[q] = X[p * NFH + q];
-      for (let m = 0; m < hrrrModels.length; m++) if (hrrrModels[m]) rawH[m][p] = rawChance(hrrrModels[m], x);
+      for (let m = 0; m < allH.length; m++) if (allH[m]) rawH[m][p] = rawChance(allH[m], x);
     }
-    for (let m = 0; m < hrrrModels.length; m++) {
-      if (!hrrrModels[m]) continue;
-      const sigma = blurAt(hrrrModels[m], f0 + 9);
+    const smH = allH.map(() => null);
+    for (let m = 0; m < allH.length; m++) {
+      if (!allH[m]) continue;
+      const sigma = blurAt(allH[m], f0 + 9);
       let v = rawH[m];
       if (sigma > 0) {
         const full = new Float32Array(NP).fill(NaN);
@@ -398,9 +427,10 @@ async function hrrrChances(D) {
         const sm = smooth(full, () => sigma);
         v = us.map(({ k }) => sm[k]);
       }
-      for (let p = 0; p < us.length; p++) out[m * us.length + p] = Math.round(100 * calibrated(hrrrModels[m], v[p]));
+      smH[m] = v;
+      if (hrrrModels[m]) for (let p = 0; p < us.length; p++) out[m * us.length + p] = Math.round(100 * calibrated(hrrrModels[m], v[p]));
     }
-    return { run, f0, out };
+    return { run, f0, out, sm: smH };
   }
   return null;
 }
@@ -448,6 +478,8 @@ async function gefsChances() {
   const genv = plan.map(() => Object.fromEntries(SNAPS.map((w) => [w, new Float32Array(NP * NE)])));
   const sum = plan.map(() => GM.map(() => new Float32Array(NP)));
   const cnt = plan.map(() => new Uint8Array(NP));
+  // Day 1's sums of squares, for the members' spread (the consensus reads it).
+  const sq1 = GM.map(() => new Float32Array(NP));
   const x = new Float32Array(GF.length);
   const t1 = Date.now();
   let used = 0;
@@ -457,6 +489,7 @@ async function gefsChances() {
     const take = () => {
       for (let d = 0; d < plan.length; d++) {
         for (let m = 0; m < GM.length; m++) { const a = sum[d][m]; const b = mSum[d][m]; for (let k = 0; k < NP; k++) a[k] += b[k]; }
+        if (d === 0) for (let m = 0; m < GM.length; m++) { const a = sq1[m]; const b = mSum[0][m]; for (let k = 0; k < NP; k++) a[k] += b[k] * b[k]; }
         for (let k = 0; k < NP; k++) cnt[d][k] += mCnt[d][k];
       }
       used++;
@@ -571,6 +604,22 @@ async function gefsChances() {
     const sm = smooth(mean, (k) => blurAt(model, p.a[k % NX]));
     return sm.map((v, k) => (Number.isFinite(v) ? calibrated(model, v, p.a[k % NX]) : NaN));
   }));
+  // Day 1's smoothed mean and spread, uncalibrated, for the consensus.
+  if (CONSENSUS) {
+    const p = plan[0];
+    out.day1 = { mean: [], spread: [] };
+    GM.forEach((model, m) => {
+      const mean = new Float32Array(NP).fill(NaN);
+      const sd = new Float32Array(NP).fill(NaN);
+      for (let k = 0; k < NP; k++) {
+        if (cnt[0][k] !== used) continue;
+        mean[k] = sum[0][m][k] / used;
+        sd[k] = Math.sqrt(Math.max(0, sq1[m][k] / used - mean[k] * mean[k]));
+      }
+      out.day1.mean.push(smooth(mean, (k) => blurAt(model, p.a[k % NX])));
+      out.day1.spread.push(smooth(sd, (k) => blurAt(model, p.a[k % NX])));
+    });
+  }
   console.log(`GEFS: ${used} members in ${((Date.now() - t1) / 1000).toFixed(0)} s`);
   return out;
 }
@@ -663,9 +712,20 @@ for (let d = 0; d < plan.length; d++) {
     }
     if (PROBE.has(k)) console.log(`probe ${PROBE.get(k)} day ${d}: raw`, HAZARDS.map((h, m) => `${h} ${m < models.length ? (100 * rawP[m][k]).toFixed(1) : thunder[k]}%`).join(' '), '\n ', FEATURES.map((f, i) => `${f}=${+x[i].toFixed(1)}`).join(' '));
   }
+  const hr = await hrrrChances(plan[d].D).catch((err) => { console.log('HRRR:', err.message); return null; });
+  const smAll = models.map((model, m) => (model ? smooth(rawP[m], (k) => blurAt(model, plan[d].a[k % NX])) : null));
+  // Day 1's consensus where it is used: over the US (HRRR in it) it takes HRRR's place, so
+  // those points skip the overlay below, as they skip the ECMWF-based caps HRRR skips.
+  const G1 = d === 0 && CONSENSUS ? gefsDays?.day1 : null;
+  const byUs = new Uint8Array(models.length * NP);
+  let nCons = 0;
   for (let m = 0; m < models.length; m++) {
     if (!models[m]) continue;
-    const sm = smooth(rawP[m], (k) => blurAt(models[m], plan[d].a[k % NX]));
+    const sm = smAll[m];
+    const hz = STORMYCAST_HAZARDS[m];
+    const pm = PARENT[hz] ? STORMYCAST_HAZARDS.indexOf(PARENT[hz]) : -1;
+    const useUs = G1 && hr?.sm[m] && CONSENSUS.us.use.includes(hz);
+    const useGlobal = G1 && CONSENSUS.global.use.includes(hz);
     for (let k = 0; k < NP; k++) {
       if (!Number.isFinite(sm[k])) continue;
       let pr = calibrated(models[m], sm[k], plan[d].a[k % NX]);
@@ -675,6 +735,17 @@ for (let d = 0; d < plan.length; d++) {
         const w = blurAt({ blur: GEFS.models[STORMYCAST_HAZARDS[m]].weight }, plan[d].a[k % NX]);
         pr = (1 - w) * pr + w * g;
       }
+      let usValue = NaN;
+      if (useUs || useGlobal) {
+        const cv = { e: sm[k], g: G1.mean[m][k], spread: G1.spread[m][k], pe: pm >= 0 ? smAll[pm][k] : NaN, pg: pm >= 0 ? G1.mean[pm][k] : NaN };
+        const c = useGlobal ? consensusChance(CONSENSUS.global[hz], cv) : NaN;
+        if (Number.isFinite(c)) { pr = c; nCons++; }
+        const p = useUs && onLand[k] ? usAt[k] : -1;
+        if (p >= 0) {
+          const cu = consensusChance(CONSENSUS.us[hz], { ...cv, h: hr.sm[m][p], ph: pm >= 0 && hr.sm[pm] ? hr.sm[pm][p] : NaN });
+          if (Number.isFinite(cu)) { usValue = us[p].w * cu + (1 - us[p].w) * pr; nCons++; }
+        }
+      }
       let v = Math.round(100 * pr);
       if (thunder[k] >= 0 && v > thunder[k]) v = thunder[k];
       // No more than the point's ingredients carry on US forecast days.
@@ -683,18 +754,19 @@ for (let d = 0; d < plan.length; d++) {
       // Wind outside the US: scaled by how often thunderstorms there bring measured damaging
       // gusts (core/stormycast-gust.mjs, from airport reports).
       if (WIND_MODELS.has(m)) v = Math.round(v * gustFactor[k]);
+      if (Number.isFinite(usValue)) { v = Math.round(100 * usValue); byUs[m * NP + k] = 1; }
       out[m * NP + k] = v;
     }
   }
+  if (G1) console.log(`  consensus at ${nCons} point-hazards (us: ${CONSENSUS.us.use.join(',')}; global: ${CONSENSUS.global.use.join(',')})`);
   if (LTG) for (let k = 0; k < NP; k++) if (thunder[k] >= 0) out[models.length * NP + k] = thunder[k];
   for (const [k, name] of PROBE) console.log(`probe ${name} day ${d}:`, HAZARDS.map((h, m) => `${h} ${out[m * NP + k]}%`).join(' '));
-  const hr = await hrrrChances(plan[d].D).catch((err) => { console.log('HRRR:', err.message); return null; });
   if (hr) {
     for (let p = 0; p < us.length; p++) {
       const { k, w } = us[p];
       if (!onLand[k]) continue;
       for (let m = 0; m < models.length; m++) {
-        if (!hrrrModels[m]) continue;
+        if (!hrrrModels[m] || byUs[m * NP + k]) continue;
         const s = w * (HRRR_SHARE[STORMYCAST_HAZARDS[m]] ?? 1);
         out[m * NP + k] = Math.round(s * hr.out[m * us.length + p] + (1 - s) * out[m * NP + k]);
       }
