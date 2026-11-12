@@ -124,14 +124,19 @@ export function calibrated(model, p, lead = null) {
 // --- reading the published days ------------------------------------------------------------
 
 const BASE = 'https://stormycast.nexradar.pages.dev';
-const TOR = [[2, '#008b00'], [5, '#8b4726'], [10, '#ffc800'], [15, '#ff0000'], [30, '#ff00ff'], [45, '#912cee'], [60, '#104e8b']];
-const SEVERE = [[5, '#8b4726'], [15, '#ffc800'], [30, '#ff0000'], [45, '#ff00ff'], [60, '#912cee']];
-const SIG = [[1, '#5fb85f'], ...TOR];
+// 1% as a faint grey, a shade off the dark basemap: there, but not a risk area to read as one.
+const FAINT = '#6f7479';
+const TOR_UP = [[2, '#008b00'], [5, '#8b4726'], [10, '#ffc800'], [15, '#ff0000'], [30, '#ff00ff'], [45, '#912cee'], [60, '#104e8b']];
+const TOR = [[1, FAINT], ...TOR_UP];
+const SEVERE = [[1, FAINT], [5, '#8b4726'], [15, '#ffc800'], [30, '#ff0000'], [45, '#ff00ff'], [60, '#912cee']];
+const SIG = [[1, '#5fb85f'], ...TOR_UP];
+// Wind's faint level from 2%: at 1% it covers much of the tropics, where storms are near daily.
+const WIND = [[2, FAINT], ...SEVERE.slice(1)];
 // SPC's thunder levels and greens.
 const THUNDER = [[10, '#c1e9c1'], [40, '#66c57d'], [70, '#2e8b57']];
 const KINDS = [
   { id: 'tornado', hazard: 'tor', label: 'Tornado', name: 'tornado', levels: TOR },
-  { id: 'wind', hazard: 'wind', label: 'Wind', name: 'severe wind', levels: SEVERE },
+  { id: 'wind', hazard: 'wind', label: 'Wind', name: 'severe wind', levels: WIND },
   { id: 'hail', hazard: 'hail', label: 'Hail', name: 'severe hail', levels: SEVERE },
   { id: 'sig_tornado', hazard: 'sigtor', label: 'EF2+', name: 'EF2+ tornado', levels: SIG },
   { id: 'sig_wind', hazard: 'sigwind', label: '65 kt+', name: '65 kt+ wind', levels: SIG },
@@ -182,12 +187,16 @@ async function dayBytes(base, entry) {
 }
 
 /**
- * The viewer's date n − 1 days on, as YYYYMMDD. Stormycast's days run 6 am to 6 am, so
- * until 6 am the viewer is still in yesterday's.
+ * Day n's date (YYYYMMDD) where the map is looking. Stormycast's days are each place's own
+ * solar day, 6 am to 6 am, so day 1 is the one still running at the map's middle: from
+ * Australia, the US keeps its own today until 6 am there, not the viewer's.
  */
+let viewLon = () => -new Date().getTimezoneOffset() / 4;
+export function setStormycastView(fn) { viewLon = fn; }
 function dateOf(day) {
-  const d = new Date(Date.now() - 6 * 3600e3 + (day - 1) * 864e5);
-  return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+  const lon = Number(viewLon()) || 0;
+  const d = new Date(Date.now() + (lon / 15 - 6) * 3600e3 + (day - 1) * 864e5);
+  return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
 async function stormycastAreas(day, kindId) {
@@ -232,5 +241,7 @@ export const STORMYCAST = {
   days: 5,
   kinds: KINDS.map(({ id, label }) => ({ id, label })),
   load: stormycastAreas,
+  // Changes when the map moves to where another day is still running (see dateOf).
+  viewKey: () => dateOf(1),
   credit: 'Stormycast by stormy_sound, Nexradar: NOAA GEFS and, over the US, HRRR; GOES GLM lightning; ECMWF open data (CC BY 4.0); contains modified Copernicus Climate Change Service information (ERA5); SPC storm reports',
 };

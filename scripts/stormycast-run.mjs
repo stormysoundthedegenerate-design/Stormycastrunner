@@ -118,28 +118,85 @@ const zs = await ground('geopotential_at_surface', 'zs.f32');
 const lsm = await ground('land_sea_mask', 'lsm.f32');
 
 // --- the run ------------------------------------------------------------------------------------
+// Four runs a day: 00Z and 12Z do all five days; 06Z and 18Z (or --day1) only update day 1.
+const isFull = (t) => new Date(t).getUTCHours() % 12 === 0;
+// The last step each kind needs (06Z/18Z go to 144 h; an update reaches about 48 h).
+const lastStepOf = (t) => (isFull(t) ? 150 : 48);
 async function newestRun() {
   const now = Date.now();
-  for (let t = Math.floor(now / (12 * H)) * 12 * H; t > now - 4 * 864e5; t -= 12 * H) {
+  for (let t = Math.floor(now / (6 * H)) * 6 * H; t > now - 4 * 864e5; t -= 6 * H) {
     // Out when its last step needed is.
-    if (await indexOf(t, 150)) return t;
+    if (await indexOf(t, lastStepOf(t))) return t;
   }
   throw new Error('no ECMWF run found');
 }
+/**
+ * The run this hour's job is for: the newest whose data is due by now (00Z/12Z land about
+ * 7.6 h after the run, 06Z/18Z about 6.5 h), waited for up to `waitMin` minutes; else the
+ * newest out. GitHub starts timed jobs late or, now and then, early.
+ */
+async function dueRun(waitMin) {
+  const now = Date.now();
+  let t = Math.floor(now / (6 * H)) * 6 * H;
+  while (t + (isFull(t) ? 7.6 : 6.5) * H > now + 30 * 60e3) t -= 6 * H;
+  const until = now + waitMin * 60e3;
+  for (;;) {
+    indexes.delete(`${t}:${lastStepOf(t)}`);
+    if (await indexOf(t, lastStepOf(t))) return t;
+    if (Date.now() > until) break;
+    console.log(`waiting for ECMWF ${new Date(t).toISOString().slice(0, 13)}Z…`);
+    await new Promise((r) => setTimeout(r, 60e3));
+  }
+  return newestRun();
+}
 const given = args.find((a) => /^\d{10}$/.test(a));
-const RUN = given ? Date.UTC(+given.slice(0, 4), +given.slice(4, 6) - 1, +given.slice(6, 8), +given.slice(8, 10)) : await newestRun();
+const waitArg = args.find((a) => a.startsWith('--wait='));
+const RUN = given ? Date.UTC(+given.slice(0, 4), +given.slice(4, 6) - 1, +given.slice(6, 8), +given.slice(8, 10))
+  : waitArg ? await dueRun(+waitArg.slice(7)) : await newestRun();
 const runName = new Date(RUN).toISOString().slice(0, 13).replace(/[-T]/g, '');
 const runDate = Math.floor(RUN / 864e5) * 864e5;
-// Five days: a 00Z run gives its date and the four after; a 12Z run the five after its date.
+const UPDATE = !isFull(RUN) || args.includes('--day1');
+// Each point's afternoon step (≈14:40 local solar time) on a date, in hours from the run.
+const afternoonStep = (D, i) => Math.round((D + (14.7 - lonOf(i) / 15) * H - RUN) / (3 * H)) * 3;
+// Full runs, five days: a 00Z run gives its date and the four after; a 12Z run the five after
+// its date. An update gives each place its next afternoon still 9 h or more off (about when
+// it is published): from the 06Z run, today across the Americas, Europe and Africa and
+// tomorrow from about 20°E on; from the 18Z run, tomorrow everywhere. `DAY1[d]` marks the
+// columns (longitudes) date d updates; the rest of that date stays as published.
 const NDAYS = 5;
-const DATES = Array.from({ length: NDAYS }, (_, k) => k).map((k) => runDate + (new Date(RUN).getUTCHours() === 0 ? k : k + 1) * 864e5);
-console.log('run', runName, 'days', DATES.map((d) => new Date(d).toISOString().slice(0, 10)).join(' '));
+let DATES;
+let DAY1 = null;
+if (!UPDATE) {
+  DATES = Array.from({ length: NDAYS }, (_, k) => k).map((k) => runDate + (new Date(RUN).getUTCHours() === 0 ? k : k + 1) * 864e5);
+} else {
+  const cand = [-1, 0, 1, 2].map((k) => runDate + k * 864e5);
+  const pick = new Int8Array(NX);
+  for (let i = 0; i < NX; i++) pick[i] = cand.findIndex((D) => afternoonStep(D, i) >= 9);
+  // A date with only a sliver of columns (the far Pacific) hands them to the next.
+  for (let c = 0; c < cand.length - 1; c++) {
+    const n = pick.reduce((s, v) => s + (v === c), 0);
+    if (n && n < NX * 0.1) for (let i = 0; i < NX; i++) if (pick[i] === c) pick[i] = c + 1;
+  }
+  const used = [...new Set(pick)].sort((x, y) => x - y);
+  DATES = used.map((c) => cand[c]);
+  DAY1 = used.map((c) => Uint8Array.from(pick, (v) => (v === c ? 1 : 0)));
+}
+console.log('run', runName, UPDATE ? 'day 1 update,' : '', 'days', DATES.map((d) => new Date(d).toISOString().slice(0, 10)).join(' '));
 // Splitting the run over several machines (the GitHub workflow): --print-run just names the
 // run (YYYYMMDDHH) for the other jobs; --gefs-member=NAME --gefs-out=DIR works out one GEFS
 // member's raw chances alone and leaves them in DIR; the main run, --gefs-from=DIR, reads the
 // members it finds there and works out any missing itself.
 const argOpt = (k) => args.find((a) => a.startsWith(`--${k}=`))?.slice(k.length + 3);
-if (args.includes('--print-run')) { console.log(`RUN=${runName}`); process.exit(0); }
+if (args.includes('--print-run')) {
+  // GO=no when this run is already live (a job that started early found only the last one).
+  let go = 'yes';
+  try {
+    const live = await (await fetch('https://stormycast.nexradar.pages.dev/latest.json', { signal: AbortSignal.timeout(20000) })).json();
+    if (Date.parse(live.run) >= RUN && !args.includes('--force')) go = 'no';
+  } catch { /* can't tell: run it */ }
+  console.log(`RUN=${runName}\nGO=${go}`);
+  process.exit(0);
+}
 const GEFS_MEMBER = argOpt('gefs-member') || null;
 const GEFS_OUT = argOpt('gefs-out') || null;
 const GEFS_FROM = argOpt('gefs-from') || null;
@@ -652,6 +709,9 @@ const SOURCE = FEATURES.map((f) => {
   throw new Error(`unknown input ${f}`);
 });
 const entries = [];
+// What is live now (the workflow pulls it first): an update keeps its other columns.
+let published = { days: [] };
+try { published = JSON.parse(readFileSync(join(SITE, 'latest.json'), 'utf8')); } catch { /* first run */ }
 for (let d = 0; d < plan.length; d++) {
   const E = env[d];
   const A = E.a;
@@ -712,7 +772,9 @@ for (let d = 0; d < plan.length; d++) {
     }
     if (PROBE.has(k)) console.log(`probe ${PROBE.get(k)} day ${d}: raw`, HAZARDS.map((h, m) => `${h} ${m < models.length ? (100 * rawP[m][k]).toFixed(1) : thunder[k]}%`).join(' '), '\n ', FEATURES.map((f, i) => `${f}=${+x[i].toFixed(1)}`).join(' '));
   }
-  const hr = await hrrrChances(plan[d].D).catch((err) => { console.log('HRRR:', err.message); return null; });
+  // An update date that leaves the US as it was needs no HRRR.
+  const usHere = !DAY1 || DAY1[d].some((v, i) => v && lonOf(i) > -126 && lonOf(i) < -66);
+  const hr = !usHere ? null : await hrrrChances(plan[d].D).catch((err) => { console.log('HRRR:', err.message); return null; });
   const smAll = models.map((model, m) => (model ? smooth(rawP[m], (k) => blurAt(model, plan[d].a[k % NX])) : null));
   // Day 1's consensus where it is used: over the US (HRRR in it) it takes HRRR's place, so
   // those points skip the overlay below, as they skip the ECMWF-based caps HRRR skips.
@@ -781,16 +843,32 @@ for (let d = 0; d < plan.length; d++) {
   }
   const date = new Date(plan[d].D).toISOString().slice(0, 10).replace(/-/g, '');
   const file = `${date}-${runName}.bin.gz`;
+  // An update keeps the published day outside its own columns (DAY1).
+  let base = null;
+  if (DAY1) {
+    const old = published.days.find((e) => e.date === date);
+    try {
+      if (old && existsSync(join(SITE, old.file))) {
+        const ob = gunzipSync(readFileSync(join(SITE, old.file)));
+        const oh = old.hazards || STORMYCAST_HAZARDS;
+        for (let m = 0; m < HAZARDS.length; m++) {
+          const om = oh.indexOf(HAZARDS[m]);
+          for (let k = 0; k < NP; k++) if (!DAY1[d][k % NX]) out[m * NP + k] = om >= 0 ? ob[om * NP + k] : 0;
+        }
+        base = old.run;
+        console.log(`  kept ${old.file} outside this update's ${DAY1[d].reduce((s, v) => s + v, 0)} columns`);
+      } else console.log(`  no published ${date} to update: all of it from this run`);
+    } catch (err) { console.log(`  couldn't read ${old.file} (${err.message}): all of it from this run`); }
+  }
   writeFileSync(join(SITE, file), gzipSync(out, { level: 9 }));
-  entries.push({ date, run: new Date(RUN).toISOString(), file, hazards: HAZARDS, ...(hr ? { hrrr: new Date(hr.run).toISOString() } : {}), ...(gefsDays ? { gefs: GEFS.members || 5 } : {}) });
+  entries.push({ date, run: new Date(RUN).toISOString(), file, hazards: HAZARDS, ...(base ? { update: true, base } : {}), ...(hr ? { hrrr: new Date(hr.run).toISOString() } : {}), ...(gefsDays ? { gefs: GEFS.members || 5 } : {}) });
   const top = HAZARDS.map((h, m) => `${h} ${out.subarray(m * NP, (m + 1) * NP).reduce((a, v) => (v > a ? v : a), 0)}%`).join(', ');
   console.log(`${date}: ${file} (${((Date.now() - t1) / 1000).toFixed(0)} s; highest ${top})`);
 }
 
 // latest.json: the newest run's file for each date from yesterday on. Days older than a
 // month are dropped from the site.
-let prev = { days: [] };
-try { prev = JSON.parse(readFileSync(join(SITE, 'latest.json'), 'utf8')); } catch { /* first run */ }
+const prev = published;
 const byDate = new Map(prev.days.map((e) => [e.date, e]));
 for (const e of entries) if (!byDate.has(e.date) || byDate.get(e.date).run <= e.run) byDate.set(e.date, e);
 const keepFrom = new Date(Date.now() - 31 * 864e5).toISOString().slice(0, 10).replace(/-/g, '');
@@ -798,7 +876,7 @@ const days = [...byDate.values()].filter((e) => e.date >= keepFrom).sort((a, b) 
 const live = new Set(days.map((e) => e.file));
 for (const f of readdirSync(SITE)) if (f.endsWith('.bin.gz') && !live.has(f)) unlinkSync(join(SITE, f));
 writeFileSync(join(SITE, 'latest.json'), JSON.stringify({
-  model: 'Stormycast', run: new Date(RUN).toISOString(), hazards: HAZARDS,
+  model: 'Stormycast', run: new Date(RUN).toISOString(), ...(UPDATE ? { update: true } : {}), hazards: HAZARDS,
   grid: { nx: NX, ny: NY, west: -180, south: -90, north: 90, step: 0.5, rows: 'north first' }, days,
 }));
 writeFileSync(join(SITE, '_headers'), '/*\n  Access-Control-Allow-Origin: *\n  Cache-Control: public, max-age=600\n');

@@ -1,7 +1,8 @@
 Stormycast model and forecasts
 Copyright (c) 2026 stormy_sound (Nexradar)
 
-The trained models (public/js/core/stormycast-model.mjs, public/js/core/stormycast-hrrr-model.mjs)
+The trained models (public/js/core/stormycast-model.mjs, stormycast-gefs-model.mjs,
+stormycast-hrrr-model.mjs, stormycast-consensus.mjs and stormycast-gust.mjs in that folder)
 and the forecasts Stormycast publishes (https://stormycast.nexradar.pages.dev) are licensed
 under the Creative Commons Attribution 4.0 International licence (CC BY 4.0):
 https://creativecommons.org/licenses/by/4.0/
@@ -12,4 +13,6 @@ Attribution: "Stormycast by stormy_sound, Nexradar" with a link to https://nexra
 The models were made with data from others, which keep their own terms:
 - ECMWF open data (IFS forecasts), © ECMWF, CC BY 4.0.
 - ERA5: contains modified Copernicus Climate Change Service information.
-- NOAA HRRR forecasts, GOES GLM lightning and Storm Prediction Center storm reports (public domain).
+- NOAA GEFS and HRRR forecasts, the GEFSv12 reforecast, GOES GLM lightning, and Storm Prediction
+  Center storm reports and outlooks (public domain).
+- Iowa Environmental Mesonet airport (METAR) gust records.
