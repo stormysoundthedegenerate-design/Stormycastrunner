@@ -17,7 +17,9 @@ if (!r?.ok) {
 }
 const doc = await r.json();
 let n = 0;
-for (const e of doc.days || []) {
+// The days shown now, and the earlier runs' (latest.json `history`) the website can go back to.
+const files = new Map([...(doc.days || []), ...(doc.history || []).flatMap((h) => h.days || [])].map((e) => [e.file, e]));
+for (const e of files.values()) {
   if (!/^\d{8}-\d{10}\.bin\.gz$/.test(e.file)) continue;
   const f = await fetch(`${BASE}/${e.file}`, { signal: AbortSignal.timeout(60000) }).catch(() => null);
   if (!f?.ok) { console.log('missing', e.file); continue; }
@@ -34,4 +36,4 @@ for (const name of ['scores.json', 'score-pending.json']) {
 }
 // Only days whose file came down are kept.
 writeFileSync(join(SITE, 'latest.json'), JSON.stringify(doc));
-console.log(`pulled ${n} of ${(doc.days || []).length} days (run ${doc.run})`);
+console.log(`pulled ${n} of ${files.size} day files (run ${doc.run}, ${(doc.history || []).length} earlier runs)`);

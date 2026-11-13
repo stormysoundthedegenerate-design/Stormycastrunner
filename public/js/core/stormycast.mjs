@@ -221,7 +221,7 @@ async function stormycastAreas(day, kindId) {
     if (areasKept.size > 24) areasKept.delete(areasKept.keys().next().value);
   }
   const start = Date.UTC(+entry.date.slice(0, 4), +entry.date.slice(4, 6) - 1, +entry.date.slice(6, 8));
-  return areas.filter(([, , polys]) => polys.length).map(([L, colour, polys]) => ({
+  const features = areas.filter(([, , polys]) => polys.length).map(([L, colour, polys]) => ({
     type: 'Feature',
     geometry: { type: 'MultiPolygon', coordinates: polys },
     properties: {
@@ -230,6 +230,10 @@ async function stormycastAreas(day, kindId) {
       machine: 'Stormycast',
     },
   }));
+  // The day's run even when it has no areas, and whether it was a day 1 update (06Z/18Z).
+  features.run = entry.run;
+  features.update = !!entry.update;
+  return features;
 }
 
 /** Stormycast, for the outlook hook. */

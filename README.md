@@ -35,6 +35,7 @@ Each run is split across several machines:
 - One job waits for ECMWF's data and names the run (it stops if that run is already published).
 - Five jobs each work out one GEFS member.
 - The main job does ECMWF and HRRR, mixes in the members, scores, and publishes to the `stormycast` branch of a Cloudflare Pages project.
+- Another keeps every run for the record on the `archive` branch: each run's day files as published, with a `run.json`, under `runs/YYYY/MM/YYYYMMDDHH/` (its README describes the files). The website shows only the latest run and the four before it. This job can never hold up or break the forecast.
 - A separate job saves NOAA's new RRFS model and REFS ensemble at the US scoring points to the `rrfs-data` branch, for training later. NOAA keeps only two days of them. This job can never hold up or break the forecast.
 
 The files here are packed from the Nexradar project by `scripts/stormycast-runner-pack.mjs` and listed in `FILES.txt`. Training happens there, not here.

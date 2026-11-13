@@ -873,16 +873,35 @@ const byDate = new Map(prev.days.map((e) => [e.date, e]));
 for (const e of entries) if (!byDate.has(e.date) || byDate.get(e.date).run <= e.run) byDate.set(e.date, e);
 const keepFrom = new Date(Date.now() - 31 * 864e5).toISOString().slice(0, 10).replace(/-/g, '');
 const days = [...byDate.values()].filter((e) => e.date >= keepFrom).sort((a, b) => (a.date < b.date ? -1 : 1));
-const live = new Set(days.map((e) => e.file));
+// The four runs before this one, newest first, each as the site showed it: its days from
+// the day before its run on (a day 1 update with its other days from the run it updated).
+// Their files stay on the site so the website can show them.
+const runDay = (iso) => new Date(Date.parse(iso) - 864e5).toISOString().slice(0, 10).replace(/-/g, '');
+const shownBy = (doc) => ({
+  run: doc.run, ...(doc.update ? { update: true } : {}),
+  days: doc.days.filter((e) => e.date >= runDay(doc.run)).slice(0, 6),
+});
+const thisRun = new Date(RUN).toISOString();
+const history = [...(published.run ? [shownBy(published)] : []), ...(published.history || [])]
+  .filter((h, i, all) => h.run !== thisRun && all.findIndex((x) => x.run === h.run) === i)
+  .slice(0, 4);
+const live = new Set([...days, ...history.flatMap((h) => h.days)].map((e) => e.file));
 for (const f of readdirSync(SITE)) if (f.endsWith('.bin.gz') && !live.has(f)) unlinkSync(join(SITE, f));
 writeFileSync(join(SITE, 'latest.json'), JSON.stringify({
-  model: 'Stormycast', run: new Date(RUN).toISOString(), ...(UPDATE ? { update: true } : {}), hazards: HAZARDS,
-  grid: { nx: NX, ny: NY, west: -180, south: -90, north: 90, step: 0.5, rows: 'north first' }, days,
+  model: 'Stormycast', run: thisRun, ...(UPDATE ? { update: true } : {}), hazards: HAZARDS,
+  grid: { nx: NX, ny: NY, west: -180, south: -90, north: 90, step: 0.5, rows: 'north first' }, days, history,
 }));
 writeFileSync(join(SITE, '_headers'), '/*\n  Access-Control-Allow-Origin: *\n  Cache-Control: public, max-age=600\n');
 writeFileSync(join(SITE, '404.html'), '<!doctype html><meta charset="utf-8"><title>Not found</title><p>Not found.</p>\n');
 writeFileSync(join(SITE, 'index.html'), '<!doctype html><meta charset="utf-8"><title>Stormycast</title><p>Stormycast severe outlooks, for <a href="https://nexradar.pages.dev/">Nexradar</a>.</p>\n');
 console.log('wrote site-data/stormycast/site');
+
+// The outlooks as GeoJSON for other apps (stormycast-geojson.mjs). A failure here never
+// stops the publishing.
+try {
+  const { writeGeojson } = await import('./stormycast-geojson.mjs');
+  console.log(`GeoJSON outlooks: ${writeGeojson(SITE)} files`);
+} catch (err) { console.log('GeoJSON outlooks failed:', err.message); }
 
 // The scorecard (stormycast-score.mjs): this run's days noted at the US scoring points, and
 // the days now over scored against SPC's reports. A failure here never stops the publishing.

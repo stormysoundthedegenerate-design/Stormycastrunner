@@ -117,6 +117,43 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+  # Every run kept for the record on the archive branch (scripts/stormycast-archive.mjs):
+  # its day files as published, with a run.json. Whatever is live and not yet there is
+  # added, so a run whose archiving failed is caught by the next. Never holds up the forecast.
+  archive:
+    needs: [prep, run]
+    if: ${{ always() && needs.run.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    permissions:
+      contents: write # only to add files to the archive branch
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Archive the run
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch --depth=1 origin archive; then
+            git worktree add archive FETCH_HEAD
+            git -C archive switch -c archive
+          else
+            git worktree add --orphan -b archive archive
+          fi
+          # Another run's archiving may push first: then start again from what it pushed
+          # (the script only ever adds what is missing).
+          for i in 1 2 3; do
+            node scripts/stormycast-archive.mjs archive
+            git -C archive add -A
+            git -C archive diff --cached --quiet && break
+            git -C archive commit -q -m "Run ${{ needs.prep.outputs.run }}"
+            git -C archive push origin archive && break
+            git -C archive fetch --depth=1 origin archive && git -C archive reset -q --hard FETCH_HEAD
+          done
+
   # RRFS (NOAA's new storm-scale model) and REFS (its ensemble) are kept for training a
   # Stormycast model on them: NOMADS holds only their last two days, so each 00Z run's inputs
   # at the US scoring points go to the rrfs-data branch. Runs already there are skipped.

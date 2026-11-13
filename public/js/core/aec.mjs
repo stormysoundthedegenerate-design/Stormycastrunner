@@ -17,41 +17,46 @@ const AEC_RESTRICTED = 16;
 const AEC_PAD_RSI = 32;
 const ROS = 5; // the zero-block code that means "to the end of this 64-block segment"
 
+// The bit reader takes 32 bits at a time: the four bytes under the read position and
+// the top of a fifth, shifted so the next unread bit is the highest. The stream is
+// copied with 8 bytes of zeros after it, so a window never reads past the end.
+// (A byte at a time, and a new array for each block's codes, made ECMWF's fields
+// several times slower to unpack: a composite map is some 45 of them.)
 class Bits {
-  constructor(bytes) { this.b = bytes; this.pos = 0; this.end = bytes.length * 8; }
-  read(n) {
-    let v = 0;
-    let pos = this.pos;
+  constructor(bytes) {
+    this.b = new Uint8Array(bytes.length + 8);
+    this.b.set(bytes);
+    this.pos = 0;
+    this.end = bytes.length * 8;
+  }
+  /** The 32 bits from `pos` on, as an unsigned integer's bit pattern. */
+  win(pos) {
     const b = this.b;
-    for (let left = n; left > 0;) {
-      const off = pos & 7;
-      const take = Math.min(8 - off, left);
-      v = v * (1 << take) + ((b[pos >>> 3] >>> (8 - off - take)) & ((1 << take) - 1));
-      pos += take;
-      left -= take;
-    }
-    this.pos = pos;
+    const i = pos >>> 3;
+    const off = pos & 7;
+    return (((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) << off) | (b[i + 4] >>> (8 - off));
+  }
+  /** n bits (1–32), as an unsigned number. */
+  read(n) {
+    const v = this.win(this.pos) >>> (32 - n);
+    this.pos += n;
     return v;
   }
   /** A fundamental sequence: the number of zero bits before the next one. */
   fs() {
-    const b = this.b;
     let pos = this.pos;
     let n = 0;
     for (;;) {
       if (pos >= this.end) throw new Error('AEC stream ended inside a code');
-      const off = pos & 7;
-      const rest = (b[pos >>> 3] << off) & 0xff; // the unread bits of this byte, left-aligned
-      if (rest === 0) {
-        n += 8 - off;
-        pos += 8 - off;
+      const w = this.win(pos);
+      if (w === 0) {
+        n += 32;
+        pos += 32;
         continue;
       }
-      const z = Math.clz32(rest) - 24;
-      n += z;
-      pos += z + 1;
-      this.pos = pos;
-      return n;
+      const z = Math.clz32(w);
+      this.pos = pos + z + 1;
+      return n + z;
     }
   }
   align() { this.pos = (this.pos + 7) & ~7; }
@@ -89,54 +94,54 @@ export function aecDecode(data, n, { bitsPerSample: bps, flags, blockSize, rsi }
   const uncompId = (1 << idLen) - 1;
 
   const bits = new Bits(data);
-  const rsiSamples = rsi * blockSize;
-  let k = 0; // samples written to `out`
+  const fsv = new Float64Array(64); // one block's fundamental sequences, reused
+  let k = 0; // samples produced; past `n` (a last block's padding) writes go nowhere
 
   while (k < n) {
     // One reference sample interval.
     const rsiStart = k;
-    let used = 0; // samples produced in this RSI
-    const put = (v) => { if (k < n) out[k] = v; k++; used++; };
     for (let block = 0; block < rsi && k < n;) {
       const ref = pp && block === 0 ? 1 : 0;
       const id = bits.read(idLen);
       if (id === 0) {
         const second = bits.read(1);
-        if (ref) put(bits.read(bps));
+        if (ref) out[k++] = bits.read(bps);
         if (second) {
           for (let i = ref; i < blockSize;) {
             const m = bits.fs();
             if (m > 90) throw new Error('AEC second-extension code out of range');
             const d1 = m - SE[2 * m + 1];
-            if ((i & 1) === 0) { put(SE[2 * m] - d1); i++; }
-            put(d1);
+            if ((i & 1) === 0) { out[k++] = SE[2 * m] - d1; i++; }
+            out[k++] = d1;
             i++;
           }
           block++;
         } else {
           let zeroBlocks = bits.fs() + 1;
           if (zeroBlocks === ROS) {
-            const b = Math.floor(used / blockSize);
+            const b = Math.floor((k - rsiStart) / blockSize);
             zeroBlocks = Math.min(rsi - b, 64 - (b % 64));
           } else if (zeroBlocks > ROS) {
             zeroBlocks--;
           }
-          const zeros = zeroBlocks * blockSize - ref;
-          for (let i = 0; i < zeros; i++) put(0);
+          // The array starts as zeros, so these need only be counted.
+          k += zeroBlocks * blockSize - ref;
           block += zeroBlocks;
         }
       } else if (id === uncompId) {
-        for (let i = 0; i < blockSize; i++) put(bits.read(bps));
+        for (let i = 0; i < blockSize; i++) out[k++] = bits.read(bps);
         block++;
       } else {
         const kk = id - 1;
-        if (ref) put(bits.read(bps));
+        if (ref) out[k++] = bits.read(bps);
         const count = blockSize - ref;
-        const start = k;
-        const fsv = new Float64Array(count);
         for (let i = 0; i < count; i++) fsv[i] = bits.fs();
-        for (let i = 0; i < count; i++) put(kk ? fsv[i] * (1 << kk) + bits.read(kk) : fsv[i]);
-        void start;
+        if (kk) {
+          const scale = 1 << kk;
+          for (let i = 0; i < count; i++) out[k++] = fsv[i] * scale + bits.read(kk);
+        } else {
+          for (let i = 0; i < count; i++) out[k++] = fsv[i];
+        }
         block++;
       }
     }
@@ -148,6 +153,18 @@ export function aecDecode(data, n, { bitsPerSample: bps, flags, blockSize, rsi }
       const med = Math.floor(xmax / 2) + 1;
       const end = Math.min(k, n);
       let data0 = out[rsiStart];
+      if (bps <= 30) {
+        // The same in integer arithmetic, which fits below 2^31.
+        for (let i = rsiStart + 1; i < end; i++) {
+          const d = out[i];
+          const high = data0 >= med;
+          const theta = high ? xmax - data0 : data0;
+          if ((d + 1) >> 1 <= theta) data0 += d & 1 ? -((d + 1) >> 1) : d >> 1;
+          else data0 = high ? xmax - d : d;
+          out[i] = data0;
+        }
+        continue;
+      }
       for (let i = rsiStart + 1; i < end; i++) {
         const d = out[i];
         const halfD = Math.floor(d / 2) + (d % 2);
@@ -161,7 +178,6 @@ export function aecDecode(data, n, { bitsPerSample: bps, flags, blockSize, rsi }
         out[i] = data0;
       }
     }
-    void rsiSamples;
   }
   return out;
 }
