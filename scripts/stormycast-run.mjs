@@ -415,13 +415,15 @@ if (HRRR_MODEL) {
   const full = Math.max(...hoods.map((h) => h.r100.length));
   cand.forEach((c, n) => { if (hoods[n].r20.length) us.push({ ...c, hood: hoods[n], w: Math.min(1, Math.max(0, (hoods[n].r100.length / full - 0.6) / 0.3)) }); });
 }
-// 2 in+ hail stays with ECMWF (and GEFS) over the US: HRRR's model scores 0.072 on its 364
-// unseen days (2026-11-10), about what ECMWF's does, but the two are not yet compared on the
-// same days. EF2+ tornadoes are mostly HRRR's (HRRR_SHARE): on the 27 unseen days both cover,
-// HRRR's scored 0.14 against ECMWF's 0.05 (three quarters HRRR 0.13), and it puts EF2+ where
-// HRRR puts the storms rather than 150–200 km off where the coarse models' air is best.
-const HRRR_SKIP = new Set(['sighail']);
-const HRRR_SHARE = { sigtor: 0.75 };
+// 2 in+ hail and EF2+ tornadoes stay with ECMWF (and GEFS) over the US; the rest is mixed. (EF2+
+// was three quarters HRRR's from 27 days, until the longer test below.) The shares were tried
+// on the consensus's 665 days of 2024–25 (scripts/stormycast-consensus.mjs --sweep,
+// 2026-11-13): about 60% HRRR beat HRRR alone for every hazard (tornado skill .104
+// against .099 alone, hail .141 against .135, wind .189 against .183, 65 kt+ wind .052 against
+// .048), and EF2+ was best with no HRRR at all (.082; .069 at the three quarters it had from 27
+// days). HRRR alone had also wiped out the 2–4% the coarse models gave the 11 Nov EF0.
+const HRRR_SKIP = new Set(['sighail', 'sigtor']);
+const HRRR_SHARE = { tor: 0.6, hail: 0.6, wind: 0.6, sigwind: 0.6 };
 // A significant hazard is never let above its own kind (EF2+ above any tornado, and so on).
 const PARENT = { sigtor: 'tor', sighail: 'hail', sigwind: 'wind' };
 const hrrrModels = HRRR_MODEL ? STORMYCAST_HAZARDS.map((h) => (HRRR_SKIP.has(h) ? null : HRRR_MODEL.models[h])) : [];
@@ -451,28 +453,50 @@ function consensusChance(c, v) {
   for (let j = 0; j < row.length; j++) z += (c.beta[j] * (row[j] - c.mu[j])) / c.sd[j];
   return onCurveOf(c.curve, 1 / (1 + Math.exp(-z)));
 }
-/** The US day (12Z on D to 12Z next) from the newest HRRR run that covers it (48 h runs). */
+// The time the runner acts as if it were (--as-of=2026-11-11T08:40Z), so a past run can be
+// made again with only the HRRR runs that were out then.
+const AS_OF = argOpt('as-of') ? Date.parse(argOpt('as-of')) : null;
+// How many of HRRR's 48-hour runs (6 hours apart) are averaged: one run alone flips from cycle
+// to cycle (11 Nov 2026: 3–4% at Riley, Indiana from the 18Z run, nothing from the 06Z one,
+// and the EF0 came), so its raw chances are taken over the newest few that cover the day.
+const HRRR_LAG = Math.max(1, Number(argOpt('hrrr-lag')) || 3);
+
+/**
+ * The US day (12Z on D to 12Z next) from HRRR: the raw chances of the newest HRRR_LAG runs
+ * that cover it (48 h runs) averaged (a time-lagged ensemble), then smoothed and calibrated
+ * as for one run at the newest one's lead.
+ */
 async function hrrrChances(D) {
   if (!us.length) return null;
   const start = D + 12 * H;
-  const newest = Math.min(start, Math.floor(Date.now() / (6 * H)) * 6 * H);
-  for (let run = newest; run >= start - 24 * H; run -= 6 * H) {
+  const newest = Math.min(start, Math.floor((AS_OF ?? Date.now()) / (6 * H)) * 6 * H);
+  const NFH = HRRR_MODEL.features.length;
+  const allH = STORMYCAST_HAZARDS.map((h) => HRRR_MODEL.models[h] || null);
+  const sum = allH.map((m) => (m ? new Float64Array(us.length) : null));
+  const runs = [];
+  let first = null;
+  for (let run = newest; run >= start - 30 * H && runs.length < HRRR_LAG; run -= 6 * H) {
     const f0 = Math.round((start - run) / H);
-    if (!(await hrrrHas(run, f0 + 24))) continue;
+    if (f0 + 24 > 48 || !(await hrrrHas(run, f0 + 24))) continue;
     const X = await hrrrDay(run, f0, us.map((p) => p.hood));
     if (!X) continue;
-    const NFH = HRRR_MODEL.features.length;
-    const out = new Uint8Array(hrrrModels.length * us.length);
     const x = new Float32Array(NFH);
-    // Raw chances first, then (as ECMWF's) smoothed over the US points by the model's σ for
-    // this run's lead (hours to the day's afternoon snapshot), then calibrated.
-    // Every hazard's (the consensus reads the skipped ones too); only the overlaid ones calibrated.
-    const allH = STORMYCAST_HAZARDS.map((h) => HRRR_MODEL.models[h] || null);
-    const rawH = allH.map((m) => (m ? new Float64Array(us.length) : null));
     for (let p = 0; p < us.length; p++) {
       for (let q = 0; q < NFH; q++) x[q] = X[p * NFH + q];
-      for (let m = 0; m < allH.length; m++) if (allH[m]) rawH[m][p] = rawChance(allH[m], x);
+      for (let m = 0; m < allH.length; m++) if (allH[m]) sum[m][p] += rawChance(allH[m], x);
     }
+    runs.push(run);
+    first ??= { run, f0 };
+  }
+  if (!first) return null;
+  {
+    const { run, f0 } = first;
+    console.log(`  HRRR runs averaged: ${runs.map((r) => new Date(r).toISOString().slice(5, 13).replace('T', ' ') + 'Z').join(', ')}`);
+    const out = new Uint8Array(hrrrModels.length * us.length);
+    // Raw chances first (the runs' mean), then (as ECMWF's) smoothed over the US points by the
+    // model's σ for the newest run's lead (hours to the day's afternoon snapshot), then calibrated.
+    // Every hazard's (the consensus reads the skipped ones too); only the overlaid ones calibrated.
+    const rawH = sum.map((s) => (s ? s.map((v) => v / runs.length) : null));
     const smH = allH.map(() => null);
     for (let m = 0; m < allH.length; m++) {
       if (!allH[m]) continue;
@@ -834,6 +858,11 @@ for (let d = 0; d < plan.length; d++) {
       }
     }
     console.log(`  US from HRRR ${new Date(hr.run).toISOString().slice(0, 13)}Z, hours ${hr.f0 + 1}–${hr.f0 + 24}`);
+    for (const [k, name] of PROBE) {
+      const p = usAt[k];
+      if (p < 0) continue;
+      console.log(`probe ${name} day ${d}: HRRR's own`, HAZARDS.slice(0, models.length).map((h, m) => `${h} ${hrrrModels[m] ? hr.out[m * us.length + p] : '-'}%`).join(' '), '· after the mix', HAZARDS.slice(0, models.length).map((h, m) => `${h} ${out[m * NP + k]}%`).join(' '));
+    }
   }
   for (const [sig, parent] of Object.entries(PARENT)) {
     const a = STORMYCAST_HAZARDS.indexOf(sig);
