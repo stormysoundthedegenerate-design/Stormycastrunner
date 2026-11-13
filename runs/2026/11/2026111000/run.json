@@ -1,0 +1,40 @@
+{
+ "days": [
+  {
+   "date": "20261110",
+   "run": "2026-11-10T00:00:00.000Z",
+   "file": "20261110-2026111000.bin.gz",
+   "hazards": [
+    "tor",
+    "sigtor",
+    "hail",
+    "sighail",
+    "wind",
+    "sigwind",
+    "thunder"
+   ],
+   "hrrr": "2026-11-10T06:00:00.000Z",
+   "gefs": 5
+  }
+ ],
+ "model": "Stormycast",
+ "run": "2026-11-10T00:00:00.000Z",
+ "hazards": [
+  "tor",
+  "sigtor",
+  "hail",
+  "sighail",
+  "wind",
+  "sigwind",
+  "thunder"
+ ],
+ "grid": {
+  "nx": 720,
+  "ny": 361,
+  "west": -180,
+  "south": -90,
+  "north": 90,
+  "step": 0.5,
+  "rows": "north first"
+ }
+}
