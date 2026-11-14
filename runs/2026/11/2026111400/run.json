@@ -1,0 +1,100 @@
+{
+ "days": [
+  {
+   "date": "20261114",
+   "run": "2026-11-14T00:00:00.000Z",
+   "file": "20261114-2026111400.bin.gz",
+   "hazards": [
+    "tor",
+    "sigtor",
+    "hail",
+    "sighail",
+    "wind",
+    "sigwind",
+    "thunder"
+   ],
+   "hrrr": "2026-11-14T06:00:00.000Z",
+   "gefs": 5
+  },
+  {
+   "date": "20261115",
+   "run": "2026-11-14T00:00:00.000Z",
+   "file": "20261115-2026111400.bin.gz",
+   "hazards": [
+    "tor",
+    "sigtor",
+    "hail",
+    "sighail",
+    "wind",
+    "sigwind",
+    "thunder"
+   ],
+   "gefs": 5
+  },
+  {
+   "date": "20261116",
+   "run": "2026-11-14T00:00:00.000Z",
+   "file": "20261116-2026111400.bin.gz",
+   "hazards": [
+    "tor",
+    "sigtor",
+    "hail",
+    "sighail",
+    "wind",
+    "sigwind",
+    "thunder"
+   ],
+   "gefs": 5
+  },
+  {
+   "date": "20261117",
+   "run": "2026-11-14T00:00:00.000Z",
+   "file": "20261117-2026111400.bin.gz",
+   "hazards": [
+    "tor",
+    "sigtor",
+    "hail",
+    "sighail",
+    "wind",
+    "sigwind",
+    "thunder"
+   ],
+   "gefs": 5
+  },
+  {
+   "date": "20261118",
+   "run": "2026-11-14T00:00:00.000Z",
+   "file": "20261118-2026111400.bin.gz",
+   "hazards": [
+    "tor",
+    "sigtor",
+    "hail",
+    "sighail",
+    "wind",
+    "sigwind",
+    "thunder"
+   ],
+   "gefs": 5
+  }
+ ],
+ "model": "Stormycast",
+ "run": "2026-11-14T00:00:00.000Z",
+ "hazards": [
+  "tor",
+  "sigtor",
+  "hail",
+  "sighail",
+  "wind",
+  "sigwind",
+  "thunder"
+ ],
+ "grid": {
+  "nx": 720,
+  "ny": 361,
+  "west": -180,
+  "south": -90,
+  "north": 90,
+  "step": 0.5,
+  "rows": "north first"
+ }
+}
